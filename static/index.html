@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dual-Rig Transceiver Control</title>
+  <link rel="stylesheet" href="/static/vendor/leaflet.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261120" />
+</head>
+<body>
+  <div class="cockpit-root">
+    <!-- TOP BAR: RADIO SELECTOR TABS, UTILITIES, METER PILLS & CLOCKS -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="rig-tabs">
+          <button id="rig-tab-1" class="rig-tab active" data-slot="1">
+            <span class="tab-dot" id="tab-dot-1"></span>
+            <span class="tab-name" id="tab-name-1">Radio 1</span>
+            <span class="tab-freq mono" id="tab-freq-1">---</span>
+            <span class="tab-mute" id="tab-mute-1" title="Toggle Radio 1 Windows Audio">🔊</span>
+          </button>
+          <button id="rig-tab-2" class="rig-tab" data-slot="2">
+            <span class="tab-dot" id="tab-dot-2"></span>
+            <span class="tab-name" id="tab-name-2">Radio 2</span>
+            <span class="tab-freq mono" id="tab-freq-2">---</span>
+            <span class="tab-mute" id="tab-mute-2" title="Toggle Radio 2 Windows Audio">🔊</span>
+          </button>
+        </div>
+
+        <div class="top-actions">
+          <button id="btn-dual-view" class="top-btn" title="Show both Radio 1 and Radio 2 simultaneously">◫ Dual View</button>
+          <button id="btn-wf-track" class="top-btn" title="Shift waterfall history horizontally when tuning VFO">⇄ WF Track</button>
+          <button id="settings-btn" class="top-btn" title="Settings — COM, Audio, Server &amp; Mobile">⚙ Settings</button>
+          <button id="audio-popover-btn" class="top-btn" title="Windows Audio Device, Routing &amp; TX Interlock">🎧 Monitor</button>
+          <button id="btn-app-update" class="top-btn" style="display:none;" title="New update available on GitHub — click to install &amp; restart">⬇ Update Available</button>
+        </div>
+      </div>
+
+      <div id="topbar-drag-spacer" class="topbar-drag pywebview-drag-region" title="Drag to move window · Double-click to maximize"></div>
+
+      <div class="topbar-right">
+        <span id="mobile-suppression-badge" class="status-pill warn pywebview-drag-region" style="display:none;">Mobile Connected · PC Muted</span>
+        <span id="audio-health-pill" class="status-pill mono pywebview-drag-region" title="Windows Audio Engine Output Status">AUDIO OK</span>
+        <span id="mode-badge" class="status-pill pywebview-drag-region">HOST</span>
+        <span id="hamlib-badge" class="status-pill mono pywebview-drag-region">Hamlib: 4532/4534</span>
+        <div class="clock-pair mono pywebview-drag-region">
+          <div class="clock-item">
+            <span class="clock-lbl">LOCAL</span>
+            <span id="local-clock" class="clock-val">--:--</span>
+          </div>
+          <div class="clock-item">
+            <span class="clock-lbl">UTC</span>
+            <span id="utc-clock" class="clock-val">--:--</span>
+          </div>
+        </div>
+        <div id="win-controls" class="win-controls" style="display:none;">
+          <button id="win-min-btn" class="win-btn" title="Minimize" aria-label="Minimize">─</button>
+          <button id="win-max-btn" class="win-btn" title="Maximize / Restore" aria-label="Maximize">□</button>
+          <button id="win-close-btn" class="win-btn win-close" title="Close" aria-label="Close">✕</button>
+        </div>
+      </div>
+
+      <!-- AUDIO ROUTING / MONITOR POPOVER -->
+      <div id="audio-popover" class="audio-popover">
+        <div class="pop-title">Windows Audio Routing &amp; Diagnostics</div>
+        <div id="pop-pc-dev" class="mono muted-xs">Output: ---</div>
+        <div class="pop-row">
+          <label for="route-r1">Radio 1 Channel</label>
+          <select id="route-r1" class="sel mono">
+            <option value="both">Both (L+R)</option>
+            <option value="right">Right (R)</option>
+            <option value="left">Left (L)</option>
+            <option value="mute">Muted</option>
+          </select>
+        </div>
+        <div class="pop-row">
+          <label for="route-r2">Radio 2 Channel</label>
+          <select id="route-r2" class="sel mono">
+            <option value="both">Both (L+R)</option>
+            <option value="left">Left (L)</option>
+            <option value="right">Right (R)</option>
+            <option value="mute">Muted</option>
+          </select>
+        </div>
+        <div class="pop-row">
+          <label>TX Interlock</label>
+          <button id="interlock-btn" class="cbtn on" style="padding:0 10px;">Interlock: ON</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- MAIN 3-COLUMN COCKPIT (SINGLE RADIO VIEW) -->
+    <div id="single-view-body" class="cockpit-body">
+      <!-- LEFT SIDEBAR: BAND, MODE, MEMORY, RX DSP / PBT / NOTCH, AGC, R.FIL, TONE/BKIN -->
+      <aside class="sidebar left-sidebar">
+        <section class="side-block">
+          <div class="block-head">
+            <span>BAND</span>
+            <span id="active-rig-mini" class="mono muted-xs">---</span>
+          </div>
+          <div id="band-grid" class="band-grid"></div>
+        </section>
+
+        <section class="side-block">
+          <div class="block-head"><span>MODE</span></div>
+          <div id="mode-grid" class="mode-grid">
+            <button class="cbtn" data-mode="LSB">LSB</button>
+            <button class="cbtn" data-mode="USB">USB</button>
+            <button class="cbtn" data-mode="CW-U">CW-U</button>
+            <button class="cbtn" data-mode="CW-R">CW-L</button>
+            <button class="cbtn" data-mode="AM">AM</button>
+            <button class="cbtn" data-mode="FM">FM</button>
+            <button class="cbtn" data-mode="DATA-U">DATA-U</button>
+            <button class="cbtn" data-mode="DATA-L">DATA-L</button>
+            <button class="cbtn" data-mode="RTTY">RTTY</button>
+          </div>
+        </section>
+
+        <section class="side-block">
+          <div class="block-head">
+            <span>MEMORY</span>
+            <button id="mem-store-btn" class="mini-pill">STORE</button>
+          </div>
+          <div id="mem-grid" class="mem-grid">
+            <button class="cbtn mem-btn" data-mem="0">M1</button>
+            <button class="cbtn mem-btn" data-mem="1">M2</button>
+            <button class="cbtn mem-btn" data-mem="2">M3</button>
+            <button class="cbtn mem-btn" data-mem="3">M4</button>
+            <button class="cbtn mem-btn" data-mem="4">M5</button>
+            <button class="cbtn mem-btn" data-mem="5">M6</button>
+          </div>
+        </section>
+
+        <section class="side-block">
+          <div class="block-head">
+            <span>RX DSP / FILTER</span>
+            <button id="btn-reset-pbt" class="mini-pill" title="Reset IF PBT1 &amp; PBT2 to center">↺ RESET</button>
+          </div>
+
+          <div id="pbt-controls" class="mini-sliders">
+            <div class="mini-sl-row">
+              <div class="sl-head"><span>PBT 1 (SHIFT)</span><span id="val-pbt1" class="sl-num mono">0</span></div>
+              <input id="sl-pbt1" class="modern-range" type="range" min="0" max="100" value="50" />
+            </div>
+            <div class="mini-sl-row">
+              <div class="sl-head"><span>PBT 2 (WIDTH)</span><span id="val-pbt2" class="sl-num mono">0</span></div>
+              <input id="sl-pbt2" class="modern-range" type="range" min="0" max="100" value="50" />
+            </div>
+          </div>
+
+          <div class="dsp-trio">
+            <button id="btn-notch" class="cbtn" title="Manual Notch Filter">NOTCH</button>
+            <button id="btn-anf" class="cbtn" title="Auto Notch Filter (ANF / DNF)">ANF</button>
+            <button id="btn-nb-left" class="cbtn" title="Noise Blanker">NB</button>
+          </div>
+
+          <div class="mini-sl-row">
+            <div class="sl-head"><span>NOTCH FREQ</span><span id="val-notch-pos" class="sl-num mono">50%</span></div>
+            <input id="sl-notch-pos" class="modern-range" type="range" min="0" max="100" value="50" />
+          </div>
+        </section>
+
+        <section class="side-block">
+          <div class="block-head"><span>AGC</span></div>
+          <div class="seg3">
+            <button class="cbtn agc-btn" data-agc="1">FAST</button>
+            <button class="cbtn agc-btn" data-agc="2">MID</button>
+            <button class="cbtn agc-btn" data-agc="3">SLOW</button>
+          </div>
+        </section>
+
+        <section class="side-block">
+          <div class="block-head">
+            <span>R.FIL</span>
+            <span id="filter-width-lbl" class="mono accent-xs">2400 Hz</span>
+          </div>
+          <div class="seg3">
+            <button class="cbtn rfil-btn" data-fil="1">FIL1 (3k)</button>
+            <button class="cbtn rfil-btn" data-fil="2">FIL2 (2.4)</button>
+            <button class="cbtn rfil-btn" data-fil="3">FIL3 (1.8)</button>
+          </div>
+        </section>
+
+        <section class="side-block">
+          <div class="block-head"><span>CW</span></div>
+          <div class="slider-block cw-speed-box">
+            <div class="sl-head"><span>CW Speed (WPM)</span><span id="val-sl-cw" class="sl-num mono">20</span></div>
+            <input id="sl-cw-wpm" class="modern-range" type="range" min="6" max="48" value="20" />
+          </div>
+          <div class="seg3">
+            <button id="btn-bkin" class="cbtn" title="CW Break-In Mode (OFF/SEMI/FULL)">BKIN: OFF</button>
+            <button id="btn-tone" class="cbtn" title="Repeater TX CTCSS Tone">TONE</button>
+            <button id="btn-tsql" class="cbtn" title="CTCSS Tone Squelch">TSQL</button>
+          </div>
+          <div class="seg4" id="cw-mem-grid" style="margin-top:4px;">
+            <button class="cbtn cw-mem-btn" data-cw="1" title="Left-click: Send CW · Right-click: Edit">CW1</button>
+            <button class="cbtn cw-mem-btn" data-cw="2" title="Left-click: Send CW · Right-click: Edit">CW2</button>
+            <button class="cbtn cw-mem-btn" data-cw="3" title="Left-click: Send CW · Right-click: Edit">CW3</button>
+            <button class="cbtn cw-mem-btn" data-cw="4" title="Left-click: Send CW · Right-click: Edit">CW4</button>
+          </div>
+          <div id="cw-edit-bar" class="cw-edit-bar" style="display:none;">
+            <input id="cw-edit-input" class="tin mono cw-edit-input" type="text" maxlength="60" placeholder="CW macro text..." />
+            <button id="cw-edit-ok" class="mini-pill active" type="button">OK</button>
+          </div>
+          <div class="cw-live-wrap">
+            <input id="cw-live-input" class="tin mono cw-live-input" type="text" maxlength="120" placeholder="Type CW text &amp; Enter..." />
+            <button id="btn-cw-send" class="cbtn cw-send-btn" type="button" title="Send typed CW text (Enter)">SEND</button>
+          </div>
+        </section>
+
+        <section class="side-block" style="margin-top:auto;">
+          <div class="block-head">
+            <span>VOICE MEMORY</span>
+            <span id="vm-status-lbl" class="mono muted-xs">READY</span>
+          </div>
+          <div class="seg4" id="vm-grid">
+            <button class="cbtn vm-btn" data-vm="1">V1</button>
+            <button class="cbtn vm-btn" data-vm="2">V2</button>
+            <button class="cbtn vm-btn" data-vm="3">V3</button>
+            <button class="cbtn vm-btn" data-vm="4">V4</button>
+          </div>
+          <div class="vm-actions-row">
+            <button id="btn-vm-rec" class="cbtn">● REC</button>
+            <button id="btn-vm-timer" class="cbtn" title="Auto-repeat activated Voice Memory">TIMER</button>
+            <select id="sel-vm-timer" class="vm-timer-sel" title="Delay after TX before repeating (1-10s)">
+              <option value="1">1s</option>
+              <option value="2">2s</option>
+              <option value="3">3s</option>
+              <option value="4">4s</option>
+              <option value="5" selected>5s</option>
+              <option value="6">6s</option>
+              <option value="7">7s</option>
+              <option value="8">8s</option>
+              <option value="9">9s</option>
+              <option value="10">10s</option>
+            </select>
+          </div>
+        </section>
+      </aside>
+
+      <!-- CENTER STAGE: ANALOG METER + 5 BARGRAPHS + VFO-A/B + UTILITY BAR + WATERFALL -->
+      <main class="center-stage">
+        <!-- 1. TOP METERS ROW -->
+        <div class="meters-deck">
+          <div class="analog-card">
+            <canvas id="analog-meter-canvas" title="Click to switch S-Meter style (4 designs)"></canvas>
+          </div>
+
+          <div class="bargraphs-card">
+            <div class="bar-row">
+              <span class="bar-lbl mono">S</span>
+              <canvas id="bar-s" class="bar-canvas"></canvas>
+              <span id="val-s" class="bar-val mono">S0</span>
+            </div>
+            <div class="bar-row">
+              <span class="bar-lbl mono">PO</span>
+              <canvas id="bar-po" class="bar-canvas"></canvas>
+              <span id="val-po" class="bar-val mono">0%</span>
+            </div>
+            <div class="bar-row">
+              <span class="bar-lbl mono">SWR</span>
+              <canvas id="bar-swr" class="bar-canvas"></canvas>
+              <span id="val-swr" class="bar-val mono">--</span>
+            </div>
+            <div class="bar-row">
+              <span class="bar-lbl mono">ALC</span>
+              <canvas id="bar-alc" class="bar-canvas"></canvas>
+              <span id="val-alc" class="bar-val mono">--</span>
+            </div>
+            <div class="bar-row">
+              <span class="bar-lbl mono">COMP</span>
+              <canvas id="bar-comp" class="bar-canvas"></canvas>
+              <span id="val-comp" class="bar-val mono">0 dB</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 2. VFO-A (MAIN) & VFO-B (SUB) CARDS -->
+        <div class="vfo-deck">
+          <div id="vfo-card-main" class="vfo-box active">
+            <div class="vfo-split-row">
+              <div id="freq-main" class="freq-big mono">0.000.000</div>
+              <div class="vfo-meta-col">
+                <div class="vfo-badges">
+                  <span id="tag-main" class="vfo-pill vfo-act">VFO-A</span>
+                  <span id="rxtx-pill" class="vfo-pill green">RX</span>
+                  <span id="mode-pill-main" class="vfo-pill neutral">USB</span>
+                </div>
+                <div class="vfo-flags">
+                  <button id="btn-lock-vfo" class="mini-pill" title="Lock VFO tuning">LOCK</button>
+                  <button id="btn-fine-vfo" class="mini-pill" title="Fine tuning (50 Hz step)">FINE</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div id="vfo-card-sub" class="vfo-box">
+            <div class="vfo-split-row">
+              <div id="freq-sub" class="freq-sub mono">0.000.000</div>
+              <div class="vfo-meta-col">
+                <div class="vfo-badges">
+                  <span id="tag-sub" class="vfo-pill neutral">VFO-B</span>
+                  <span id="mode-pill-sub" class="vfo-pill neutral">LSB</span>
+                </div>
+                <div class="vfo-flags">
+                  <button id="btn-dualwatch" class="mini-pill" style="display:none;">DW</button>
+                  <span id="sub-s-lbl" class="mono muted-xs">S0</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 3. UTILITY / VFO ACTION STRIP -->
+        <div class="vfo-toolbar">
+          <div class="tool-grp">
+            <button id="btn-step-down" class="tbtn">-</button>
+            <button id="btn-step-up" class="tbtn">+</button>
+            <button id="btn-ab-swap" class="tbtn">A/B</button>
+            <button id="btn-ab-eq" class="tbtn">A=B</button>
+            <button id="btn-split" class="tbtn">SPLIT</button>
+            <button id="btn-vox" class="tbtn">VOX</button>
+            <button id="btn-rit" class="tbtn">RIT</button>
+            <button id="btn-rit-down" class="tbtn">-</button>
+            <span id="rit-val-lbl" class="rit-readout mono">0.00 kHz</span>
+            <button id="btn-rit-up" class="tbtn">+</button>
+            <button id="btn-rit-clr" class="tbtn">CLR</button>
+          </div>
+          <!-- REPEATER AUTO-SUGGEST INLINE BETWEEN CLR AND REPEATERS -->
+          <div id="rep-suggest-bar" class="rep-suggest-bar rep-inline" style="display:none;">
+            <button id="btn-rep-apply" class="rep-apply-btn" title="Click to activate repeater offset &amp; tone on radio">---</button>
+            <select id="rep-match-sel" class="tsel rep-match-sel" style="display:none;" title="Multiple repeaters found on this frequency"></select>
+          </div>
+          <div class="tool-grp">
+            <button id="btn-repeaters-open" class="tbtn" style="display:none;" title="Browse Nordic &amp; Finnish Repeaters">📡 Repeaters</button>
+            <button id="btn-1750-top" class="tbtn warn" style="display:none;">1750 Hz</button>
+          </div>
+        </div>
+
+        <!-- 4. RADIO WATERFALL (COMPACT 3D YAESU + CRISP 2D ICOM WATERFALL) -->
+        <div class="waterfall-card">
+          <div class="wf-toolbar">
+            <div class="wf-left">
+              <span class="wf-title">RADIO WATERFALL</span>
+              <span class="tlabel">SPAN</span>
+              <div class="span-pills">
+                <button class="wf-span-btn" data-span="50000">±25k</button>
+                <button class="wf-span-btn active" data-span="100000">±50k</button>
+                <button class="wf-span-btn" data-span="200000">±100k</button>
+                <button class="wf-span-btn" data-span="500000">±250k</button>
+              </div>
+              <button id="btn-swr-scan" class="wf-swr-btn" title="Sweep visible waterfall span &amp; plot SWR curve on waterfall">SWR SCAN</button>
+              <button id="btn-swr-clear" class="wf-swr-clear" style="display:none;" title="Clear SWR overlay curve">✕ SWR</button>
+            </div>
+            <div class="wf-right">
+              <span id="wf-hover-hz" class="mono muted-xs">Wheel: 1 kHz · Click: Tune</span>
+              <span class="mini-pill active">3D + 2D</span>
+            </div>
+          </div>
+          <div class="wf-canvas-wrap">
+            <canvas id="scope-canvas"></canvas>
+          </div>
+        </div>
+      </main>
+
+      <!-- RIGHT SIDEBAR: MODERN SLIDERS (WIN VOL, AF, PWR, RF, SQL, DNR, NB, MIC, COMP, MON, CW), IPO/AMP, ATT, ATU, PTT -->
+      <aside class="sidebar right-sidebar">
+        <div class="slider-block">
+          <div class="sl-head">
+            <span>WIN VOLUME <button id="btn-win-mute" class="mini-mute">ON</button></span>
+            <span id="val-sl-win" class="sl-num mono">85%</span>
+          </div>
+          <input id="sl-win" class="modern-range" type="range" min="0" max="100" value="85" />
+        </div>
+
+        <div class="slider-block">
+          <div class="sl-head"><span>AF Gain (Radio)</span><span id="val-sl-af" class="sl-num mono">50</span></div>
+          <input id="sl-af" class="modern-range" type="range" min="0" max="100" value="50" />
+        </div>
+
+        <div class="slider-block">
+          <div class="sl-head"><span>TX Power (%)</span><span id="val-sl-pwr" class="sl-num mono">50%</span></div>
+          <input id="sl-pwr" class="modern-range" type="range" min="1" max="100" value="50" />
+        </div>
+
+        <div class="slider-block">
+          <div class="sl-head"><span>RF Gain</span><span id="val-sl-rf" class="sl-num mono">100</span></div>
+          <input id="sl-rf" class="modern-range" type="range" min="0" max="100" value="100" />
+        </div>
+
+        <div class="slider-block">
+          <div class="sl-head"><span>SQL (Squelch)</span><span id="val-sl-sql" class="sl-num mono">15</span></div>
+          <input id="sl-sql" class="modern-range" type="range" min="0" max="100" value="15" />
+        </div>
+
+        <section class="side-block">
+          <div class="seg3">
+            <button class="cbtn pre-btn" data-pre="0">IPO</button>
+            <button class="cbtn pre-btn" data-pre="1">AMP1</button>
+            <button class="cbtn pre-btn" data-pre="2">AMP2</button>
+          </div>
+        </section>
+
+        <div class="slider-block">
+          <div class="sl-head">
+            <span>DNR (NR) <button id="btn-nr-right" class="mini-pill">OFF</button></span>
+            <span id="val-sl-nr" class="sl-num mono">50%</span>
+          </div>
+          <input id="sl-nr-lvl" class="modern-range" type="range" min="0" max="100" value="50" />
+        </div>
+
+        <div class="slider-block">
+          <div class="sl-head">
+            <span>NB (Blanker) <button id="btn-nb-right" class="mini-pill">OFF</button></span>
+            <span id="val-sl-nb" class="sl-num mono">50%</span>
+          </div>
+          <input id="sl-nb-lvl" class="modern-range" type="range" min="0" max="100" value="50" />
+        </div>
+
+        <div class="slider-block">
+          <div class="sl-head"><span>MIC Gain</span><span id="val-sl-mic" class="sl-num mono">50%</span></div>
+          <input id="sl-mic" class="modern-range" type="range" min="0" max="100" value="50" />
+        </div>
+
+        <div class="slider-block">
+          <div class="sl-head">
+            <span>COMP (PROC) <button id="btn-comp-sw" class="mini-pill">OFF</button></span>
+            <span id="val-sl-comp" class="sl-num mono">50%</span>
+          </div>
+          <input id="sl-comp-lvl" class="modern-range" type="range" min="0" max="100" value="50" />
+        </div>
+
+        <div class="slider-block">
+          <div class="sl-head">
+            <span>TX MONITOR <button id="btn-mon-sw" class="mini-pill">OFF</button></span>
+            <span id="val-sl-mon" class="sl-num mono">50%</span>
+          </div>
+          <input id="sl-mon-lvl" class="modern-range" type="range" min="0" max="100" value="50" />
+        </div>
+
+        <button id="btn-1750-right" class="cbtn warn-full" style="display:none;">HOLD 1750 Hz TONE</button>
+
+        <div class="right-bottom-actions">
+          <div id="pass-wrap" class="pass-wrap">
+            <button id="btn-passthrough" class="cbtn pass-wide-btn" title="Feed Windows default playback device audio straight into Radio TX on PTT">AUDIO PASSTHROUGH</button>
+            <select id="sel-pass-mic" class="pass-mic-select" title="Control PC Microphone while Audio Passthrough is active">
+              <option value="ignored">Mic Ignored</option>
+              <option value="mixed">Mic Not Ignored</option>
+            </select>
+          </div>
+          <button id="btn-qso-rec" class="cbtn rec-wide-btn" title="Record RX &amp; TX audio to WAV">● REC</button>
+        </div>
+
+        <!-- ATU / ANTENNA TUNER SECTION (dynamically shown when supports_tuner is true) -->
+        <section id="atu-section" class="side-block atu-card">
+          <div class="block-head">
+            <span id="atu-status-lbl">ATU OFF</span>
+          </div>
+          <div class="seg2">
+            <button id="btn-atu-on" class="cbtn">ON</button>
+            <button id="btn-atu-off" class="cbtn">OFF</button>
+          </div>
+          <button id="btn-atu-tune" class="tune-wide-btn">TUNE</button>
+        </section>
+
+        <!-- BOTTOM PTT STACK (KEYBIND + GLOBAL + PTT + PTT HOLD) -->
+        <div id="ptt-stack" class="ptt-stack">
+          <div class="seg2">
+            <button id="btn-bind-ptt" class="cbtn" title="Assign keyboard key or mouse button for PTT">Bind: -</button>
+            <button id="btn-global-ptt" class="cbtn" title="Enable PTT hotkey even when window is unfocused">Global: OFF</button>
+          </div>
+          <div class="ptt-btn-row">
+            <button id="btn-ptt-mom" class="ptt-big-btn">PTT</button>
+            <span class="ptt-pass-warn" data-tip="Passthrough Active" title="Passthrough Active"><svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 2L1 21h22L12 2z" fill="#facc15" stroke="#713f12" stroke-width="1.5"/><rect x="11" y="9" width="2" height="6" rx="0.8" fill="#111827"/><circle cx="12" cy="17.5" r="1.2" fill="#111827"/></svg></span>
+          </div>
+          <div class="ptt-btn-row">
+            <button id="btn-ptt-hold" class="ptt-hold-btn">PTT HOLD</button>
+            <span class="ptt-pass-warn" data-tip="Passthrough Active" title="Passthrough Active"><svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 2L1 21h22L12 2z" fill="#facc15" stroke="#713f12" stroke-width="1.5"/><rect x="11" y="9" width="2" height="6" rx="0.8" fill="#111827"/><circle cx="12" cy="17.5" r="1.2" fill="#111827"/></svg></span>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <!-- DUAL RADIO SIMULTANEOUS VIEW -->
+    <div id="dual-view-body" class="dual-body" style="display:none;"></div>
+  </div>
+
+  <!-- SETTINGS MODAL -->
+  <div id="settings-backdrop" class="modal-backdrop">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <div class="modal-head">
+        <div>
+          <strong id="settings-title" style="font-size:15px;">Settings — USB Radios, Audio, Hamlib &amp; Remote Server</strong>
+          <div id="mobile-url-hint" class="mono" style="font-size:11px; color:var(--muted); margin-top:2px;"></div>
+        </div>
+        <button id="settings-close" class="top-btn">Close</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="cfg-section">
+          <h3>Operating Mode (Local Host vs. Remote Client)</h3>
+          <div class="cfg-grid">
+            <div class="field">
+              <label for="cfg-mode">Mode</label>
+              <select id="cfg-mode">
+                <option value="host">Host (USB radios connected to this PC)</option>
+                <option value="client">Client (Connect to Host PC over IP)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="cfg-qth">QTH Maidenhead Locator (Distance &amp; Azimuth)</label>
+              <input id="cfg-qth" type="text" maxlength="10" placeholder="KP20" />
+            </div>
+            <div class="field client-only">
+              <label for="cfg-client-ip">Server IP Address</label>
+              <input id="cfg-client-ip" type="text" placeholder="192.168.1.100" />
+            </div>
+            <div class="field client-only">
+              <label for="cfg-client-port">Server Port</label>
+              <input id="cfg-client-port" type="number" min="1024" max="65535" />
+            </div>
+          </div>
+        </div>
+
+        <div class="cfg-section host-only">
+          <h3>Remote Server (For 2nd PC &amp; FT8/WSJT-X Tunnel) &amp; Mobile (HTTPS)</h3>
+          <div class="cfg-grid">
+            <div class="field">
+              <label for="cfg-srv-enabled">Remote Server (allow 2nd PC connection)</label>
+              <select id="cfg-srv-enabled">
+                <option value="false">Disabled</option>
+                <option value="true">Enabled (Running)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="cfg-srv-port">Remote Server Port</label>
+              <input id="cfg-srv-port" type="number" min="1024" max="65535" />
+            </div>
+            <div class="field">
+              <label for="cfg-mob-port">Mobile HTTPS Port</label>
+              <input id="cfg-mob-port" type="number" min="1024" max="65535" />
+            </div>
+          </div>
+        </div>
+
+        <div class="cfg-section">
+          <h3>PC Audio (Speakers &amp; Microphone)</h3>
+          <div class="cfg-grid">
+            <div class="field">
+              <label for="cfg-pc-spk">PC Speakers / Headset (RX / Client FT8 Output)</label>
+              <select id="cfg-pc-spk"></select>
+            </div>
+            <div class="field">
+              <label for="cfg-pc-mic">PC Microphone (TX Audio / Client FT8 Input)</label>
+              <select id="cfg-pc-mic"></select>
+            </div>
+            <div class="field">
+              <label for="cfg-pc-vol">Master Volume (%)</label>
+              <input id="cfg-pc-vol" type="number" min="0" max="100" />
+            </div>
+          </div>
+        </div>
+
+        <div class="cfg-section host-only">
+          <h3>Radio 1 (COM, Baud, Audio Device &amp; Hamlib)</h3>
+          <div class="cfg-grid">
+            <div class="field">
+              <label for="cfg-r1-com">COM Port (USB Auto-Detect)</label>
+              <select id="cfg-r1-com"></select>
+            </div>
+            <div class="field">
+              <label for="cfg-r1-baud">Baud Rate</label>
+              <select id="cfg-r1-baud">
+                <option value="115200">115200</option>
+                <option value="57600">57600</option>
+                <option value="38400">38400</option>
+                <option value="19200">19200</option>
+                <option value="9600">9600</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="cfg-r1-ain">Radio Audio In (RX)</label>
+              <select id="cfg-r1-ain"></select>
+            </div>
+            <div class="field">
+              <label for="cfg-r1-aout">Radio Audio Out (TX)</label>
+              <select id="cfg-r1-aout"></select>
+            </div>
+            <div class="field">
+              <label for="cfg-r1-h1">Hamlib Port 1 (e.g. WSJT-X)</label>
+              <input id="cfg-r1-h1" type="number" min="1024" max="65535" />
+            </div>
+            <div class="field">
+              <label for="cfg-r1-h2">Hamlib Port 2 (e.g. N1MM / Logger)</label>
+              <input id="cfg-r1-h2" type="number" min="1024" max="65535" />
+            </div>
+          </div>
+        </div>
+
+        <div class="cfg-section host-only">
+          <h3>Radio 2 (COM, Baud, Audio Device &amp; Hamlib)</h3>
+          <div class="cfg-grid">
+            <div class="field">
+              <label for="cfg-r2-com">COM Port (USB Auto-Detect)</label>
+              <select id="cfg-r2-com"></select>
+            </div>
+            <div class="field">
+              <label for="cfg-r2-baud">Baud Rate</label>
+              <select id="cfg-r2-baud">
+                <option value="115200">115200</option>
+                <option value="57600">57600</option>
+                <option value="38400">38400</option>
+                <option value="19200">19200</option>
+                <option value="9600">9600</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="cfg-r2-ain">Radio Audio In (RX)</label>
+              <select id="cfg-r2-ain"></select>
+            </div>
+            <div class="field">
+              <label for="cfg-r2-aout">Radio Audio Out (TX)</label>
+              <select id="cfg-r2-aout"></select>
+            </div>
+            <div class="field">
+              <label for="cfg-r2-h1">Hamlib Port 1 (e.g. WSJT-X)</label>
+              <input id="cfg-r2-h1" type="number" min="1024" max="65535" />
+            </div>
+            <div class="field">
+              <label for="cfg-r2-h2">Hamlib Port 2 (e.g. N1MM / Logger)</label>
+              <input id="cfg-r2-h2" type="number" min="1024" max="65535" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-foot">
+        <button id="refresh-devices-btn" class="top-btn">Refresh USB &amp; Audio Devices</button>
+        <div style="display:flex; gap:8px;">
+          <button id="settings-cancel" class="top-btn">Cancel</button>
+          <button id="settings-save" class="top-btn primary">Save &amp; Apply</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- REPEATER BROWSER MODAL -->
+  <div id="repeaters-backdrop" class="modal-backdrop">
+    <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="repeaters-title">
+      <div class="modal-head">
+        <div>
+          <strong id="repeaters-title" style="font-size:15px;">Nordic &amp; Finnish Repeaters</strong>
+          <div id="rep-cache-meta" class="mono" style="font-size:11px; color:var(--muted); margin-top:2px;">Loading repeater cache...</div>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <button id="rep-view-list" class="top-btn active" title="Show Repeaters List">📋 List</button>
+          <button id="rep-view-map" class="top-btn" title="Show Repeaters on Google Maps">🗺 Map</button>
+          <button id="rep-refresh-btn" class="top-btn" title="Refresh repeater database from server/sources">↻ Refresh</button>
+          <button id="repeaters-close" class="top-btn">Close</button>
+        </div>
+      </div>
+      <div class="rep-filter-bar">
+        <input id="rep-search-input" class="rep-search-in" type="text" placeholder="Search callsign, QTH, frequency (e.g. 145.625, OH2)..." />
+        <select id="rep-band-filter" class="tsel">
+          <option value="all">All Bands</option>
+          <option value="2m">2m (144 MHz)</option>
+          <option value="70cm">70cm (432 MHz)</option>
+          <option value="23cm">23cm (1296 MHz)</option>
+          <option value="6m">6m (50 MHz)</option>
+          <option value="10m">10m (29 MHz)</option>
+        </select>
+        <select id="rep-mode-filter" class="tsel">
+          <option value="all">All Modes</option>
+          <option value="FM">FM</option>
+          <option value="D-STAR">D-STAR</option>
+          <option value="DMR">DMR</option>
+        </select>
+        <label class="rep-qrv-chk">
+          <input id="rep-qrv-only" type="checkbox" checked />
+          <span>QRV only</span>
+        </label>
+      </div>
+      <div class="modal-body rep-list-body">
+        <table id="rep-table" class="rep-table">
+          <thead>
+            <tr>
+              <th>Callsign</th>
+              <th>QTH / Locator</th>
+              <th>RX (MHz)</th>
+              <th>Shift</th>
+              <th>Mode</th>
+              <th>Tone</th>
+              <th>Dist / Az</th>
+              <th>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="rep-table-body"></tbody>
+        </table>
+        <div id="rep-map-wrap" class="rep-map-wrap" style="display:none;">
+          <div id="rep-map" class="rep-map"></div>
+          <div class="rep-map-toolbar mono">
+            <span><i class="map-dot" style="background:#38bdf8;"></i>2m</span>
+            <span><i class="map-dot" style="background:#f59e0b;"></i>70cm</span>
+            <span><i class="map-dot" style="background:#a78bfa;"></i>23cm</span>
+            <span><i class="map-dot" style="background:#10b981;"></i>Active</span>
+            <span><i class="map-dot" style="background:#ef4444;"></i>QRT</span>
+            <span><i class="map-dot" style="background:#f8fafc; border:2px solid #0284c7;"></i>QTH</span>
+            <select id="rep-gmap-layer" class="tsel" style="height:20px; margin-left:6px;">
+              <option value="m">Google Roadmap</option>
+              <option value="y">Google Hybrid</option>
+              <option value="p">Google Terrain</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/vendor/leaflet.js"></script>
+  <script src="/static/waterfall3d.js?v=20261120"></script>
+  <script src="/static/app.js?v=20261120"></script>
+</body>
+</html>

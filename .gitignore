@@ -1,0 +1,26 @@
+# Python & Build Artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+build/
+dist/
+*.egg-info/
+
+# Personal Runtime Config, Certs & Logs
+config.json
+certs/
+remote.log
+*.log
+
+# User Recordings & Voice Memories
+recordings/
+voice_memories/
+
+# Desktop WebView Cache & Auto-Updater State
+webview_cache/
+live_app/
+live_app_next/
+live_app_old/
+.github_sha
+.bundle_sha
+restart_*.cmd

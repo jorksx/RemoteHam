@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Remote Mobile · Dual-Rig HTTPS</title>
+  <link rel="stylesheet" href="/static/vendor/leaflet.css" />
+  <style>
+    * { box-sizing: border-box; }
+    :root {
+      --bg: #0b0e14;
+      --surface: #121722;
+      --surface2: #181f2e;
+      --border: #263147;
+      --fg: #edf2f7;
+      --muted: #8b9bb4;
+      --cyan: #38bdf8;
+      --amber: #f59e0b;
+      --green: #22c55e;
+      --red: #ef4444;
+    }
+    html, body {
+      margin: 0; padding: 0;
+      width: 100%; height: 100dvh;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+    .mob-root { display: flex; flex-direction: column; height: 100dvh; overflow: hidden; }
+    .mob-top {
+      flex-shrink: 0;
+      padding: 7px 10px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between; gap: 6px;
+    }
+    .tab-row { display: flex; gap: 4px; align-items: center; }
+    .pill-btn {
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--fg);
+      padding: 6px 9px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .pill-btn.active { background: var(--cyan); color: #0b0e14; border-color: var(--cyan); }
+    .pill-btn.amber.active { background: var(--amber); color: #0b0e14; border-color: var(--amber); }
+    .pill-btn.on { background: rgba(34, 197, 94, 0.2); border-color: var(--green); color: var(--green); }
+    .pill-btn.warn { background: rgba(245, 158, 11, 0.2); border-color: var(--amber); color: var(--amber); }
+
+    .mob-scope { flex: 1; min-height: 140px; position: relative; background: #050811; }
+    .mob-scope canvas { width: 100%; height: 100%; display: block; }
+
+    .mob-panel {
+      flex-shrink: 0;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      padding: 8px 10px;
+      display: flex; flex-direction: column; gap: 7px;
+    }
+    .meter-bar { height: 10px; border-radius: 5px; background: var(--bg); overflow: hidden; border: 1px solid var(--border); position: relative; }
+    .meter-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--cyan), var(--amber), var(--red)); transition: width 60ms; }
+    .tx-telemetry {
+      display: none;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+      padding: 6px 8px;
+      border-radius: 8px;
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.4);
+    }
+    .tx-telemetry.active { display: grid; }
+    .tx-stat { display: flex; flex-direction: column; gap: 3px; }
+    .tx-stat-top { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); font-weight: 700; }
+    .tx-stat-top strong { color: var(--fg); }
+    .tx-bar { height: 5px; border-radius: 3px; background: var(--bg); overflow: hidden; border: 1px solid var(--border); }
+    .tx-bar-fill { height: 100%; width: 0%; transition: width 60ms; }
+    .vfo-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .vfo-box {
+      padding: 5px 8px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border);
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .vfo-box.active { border-color: var(--cyan); }
+    .freq-big { font-size: 18px; font-weight: 700; }
+
+    .flywheel-wrap {
+      position: relative;
+      height: 46px;
+      border-radius: 10px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      background: #080b12;
+      touch-action: none;
+    }
+    .flywheel-canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: grab;
+      touch-action: none;
+    }
+    .flywheel-canvas:active { cursor: grabbing; }
+
+    .ctrl-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .slider-grp {
+      flex: 1; min-width: 120px;
+      display: flex; flex-direction: column; gap: 2px;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px;
+    }
+    .slider-grp label { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
+    .slider-grp input[type="range"] { width: 100%; accent-color: var(--cyan); }
+
+    .ptt-big {
+      width: 100%; padding: 13px; border-radius: 10px;
+      border: 2px solid var(--border); background: var(--surface2); color: var(--fg);
+      font-size: 15px; font-weight: 800; letter-spacing: 0.08em; cursor: pointer;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+    }
+    .ptt-big.tx { background: var(--red); border-color: var(--red); color: #fff; }
+
+    .settings-pane {
+      flex: 1; overflow-y: auto; padding: 12px; display: none; flex-direction: column; gap: 10px;
+    }
+    .settings-pane.open { display: flex; }
+    .main-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+    .main-pane.hidden { display: none; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+    select, input[type="number"], input[type="text"] {
+      background: var(--bg); border: 1px solid var(--border); color: var(--fg);
+      border-radius: 6px; padding: 6px 8px; font-size: 13px; width: 100%;
+    }
+    .mob-rep-bar {
+      display: flex; align-items: center; gap: 6px; padding: 0 8px;
+      height: 28px; min-height: 28px; flex-shrink: 0; overflow: hidden;
+      background: rgba(8, 16, 30, 0.9); border: 1px solid rgba(56, 189, 248, 0.35);
+      border-radius: 8px; font-size: 11px;
+    }
+    .mob-rep-bar.is-idle {
+      border-color: rgba(148, 163, 184, 0.16);
+      background: rgba(8, 12, 20, 0.45);
+    }
+    .mob-rep-bar.is-idle .mob-rep-apply {
+      color: var(--muted);
+      font-weight: 500;
+    }
+    .mob-rep-apply {
+      flex: 1; text-align: left; background: transparent; border: none; color: #f8fafc;
+      font-weight: 700; font-size: 11px; padding: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .mob-rep-modal {
+      position: fixed; inset: 0; z-index: 90; background: rgba(7, 10, 18, 0.96);
+      display: none; flex-direction: column; padding: 10px; gap: 8px;
+    }
+    .mob-rep-modal.open { display: flex; }
+    .mob-rep-item {
+      display: flex; justify-content: space-between; align-items: center; gap: 8px;
+      padding: 8px 10px; background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; cursor: pointer;
+    }
+    .mob-rep-item.active { border-color: var(--green); background: rgba(16, 185, 129, 0.12); }
+  </style>
+</head>
+<body>
+  <div class="mob-root">
+    <!-- TOP BAR -->
+    <header class="mob-top">
+      <div class="tab-row">
+        <button id="tab-r1" class="pill-btn active">R1</button>
+        <button id="tab-r2" class="pill-btn amber">R2</button>
+        <button id="tab-cfg" class="pill-btn">Settings</button>
+      </div>
+      <!-- Independent per-radio mute/listen toggles (both OFF by default) -->
+      <div class="tab-row">
+        <button id="mob-rx1-btn" class="pill-btn" title="Toggle Radio 1 audio on mobile">RX1: OFF</button>
+        <button id="mob-rx2-btn" class="pill-btn" title="Toggle Radio 2 audio on mobile">RX2: OFF</button>
+      </div>
+    </header>
+
+    <!-- MAIN RADIO VIEW -->
+    <div id="main-pane" class="main-pane">
+      <div class="mob-scope" id="mob-scope-wrap">
+        <canvas id="mob-scope-canvas"></canvas>
+        <div style="position:absolute; top:6px; left:8px; right:8px; display:flex; justify-content:space-between; pointer-events:none; font-size:11px;">
+          <span id="mob-rig-name" class="mono" style="background:rgba(11,14,20,0.8); padding:2px 8px; border-radius:999px; border:1px solid rgba(255,255,255,0.14);">---</span>
+          <span id="mob-s-text" class="mono" style="background:rgba(11,14,20,0.8); padding:2px 8px; border-radius:999px; border:1px solid rgba(255,255,255,0.14);">S0</span>
+        </div>
+      </div>
+
+      <div class="mob-panel">
+        <div class="meter-bar">
+          <div id="mob-s-fill" class="meter-fill"></div>
+          <div id="mob-sql-mark" style="position:absolute; top:0; bottom:0; width:2px; background:#facc15; left:15%;"></div>
+        </div>
+
+        <!-- TX Telemetry Strip (Power, ALC, SWR shown cleanly during TX) -->
+        <div id="mob-tx-telemetry" class="tx-telemetry">
+          <div class="tx-stat">
+            <div class="tx-stat-top"><span>PWR</span><strong id="mob-tx-pwr" class="mono">0%</strong></div>
+            <div class="tx-bar"><div id="mob-tx-pwr-bar" class="tx-bar-fill" style="background:var(--cyan);"></div></div>
+          </div>
+          <div class="tx-stat">
+            <div class="tx-stat-top"><span>ALC</span><strong id="mob-tx-alc" class="mono">0%</strong></div>
+            <div class="tx-bar"><div id="mob-tx-alc-bar" class="tx-bar-fill" style="background:var(--green);"></div></div>
+          </div>
+          <div class="tx-stat">
+            <div class="tx-stat-top"><span>SWR</span><strong id="mob-tx-swr" class="mono">1.00</strong></div>
+            <div class="tx-bar"><div id="mob-tx-swr-bar" class="tx-bar-fill" style="background:var(--green);"></div></div>
+          </div>
+        </div>
+
+        <div class="vfo-grid">
+          <div id="mob-vfo-main" class="vfo-box active">
+            <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--muted);">
+              <span id="mob-tag-main">MAIN</span>
+              <span id="mob-mode-main" class="mono">---</span>
+            </div>
+            <div id="mob-freq-main" class="freq-big mono">0.000.000</div>
+          </div>
+          <div id="mob-vfo-sub" class="vfo-box">
+            <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--muted);">
+              <span id="mob-tag-sub">SUB</span>
+              <span id="mob-mode-sub" class="mono">---</span>
+            </div>
+            <div id="mob-freq-sub" class="freq-big mono">0.000.000</div>
+          </div>
+        </div>
+
+        <!-- Repeater auto-suggest bar (+-5 kHz, tunes MAIN on mobile) -->
+        <div id="mob-rep-bar" class="mob-rep-bar" style="display:none;">
+          <span id="mob-rep-badge" class="pill-btn" style="padding:2px 6px; font-size:9px;">AUTO</span>
+          <button id="mob-rep-apply" class="mob-rep-apply">---</button>
+          <select id="mob-rep-sel" class="mono" style="width:auto; max-width:120px; padding:2px 4px; font-size:11px; display:none;"></select>
+        </div>
+
+        <!-- Momentary PTT (auto-activates mobile mic on press!) -->
+        <button id="mob-ptt-btn" class="ptt-big">HOLD PTT (TX + MIC)</button>
+
+        <!-- Weighted Flywheel VFO (swipe/flick left or right) -->
+        <div class="flywheel-wrap">
+          <canvas id="mob-flywheel" class="flywheel-canvas"></canvas>
+        </div>
+
+        <!-- Step, Mode, Dual RX & 1750 Hz -->
+        <div class="ctrl-row">
+          <select id="mob-step-sel" class="mono" style="width:auto;">
+            <option value="50">50 Hz</option>
+            <option value="100" selected>100 Hz</option>
+            <option value="500">500 Hz</option>
+            <option value="1000">1 kHz</option>
+            <option value="12500">12.5 kHz</option>
+            <option value="25000">25 kHz</option>
+          </select>
+          <select id="mob-mode-sel" style="width:auto; flex:1;">
+            <option value="LSB">LSB</option>
+            <option value="USB">USB</option>
+            <option value="CW">CW</option>
+            <option value="FM">FM</option>
+            <option value="DV">DV</option>
+            <option value="DIGI">DIGI</option>
+          </select>
+          <button id="mob-tuner-btn" class="pill-btn" style="display:none;">Tuner: OFF</button>
+          <button id="mob-tune-btn" class="pill-btn warn" style="display:none;">TUNE</button>
+          <button id="mob-dw-btn" class="pill-btn" style="display:none;">Dual RX</button>
+          <button id="mob-rep-open" class="pill-btn" style="display:none;">📡 Rep</button>
+          <button id="mob-1750-btn" class="pill-btn warn" style="display:none;">1750 Hz</button>
+        </div>
+
+        <!-- Independent Mobile SQL & Volume (does NOT touch Windows!) -->
+        <div class="ctrl-row">
+          <div class="slider-grp">
+            <label><span>Mobile SQL (independent)</span><strong id="mob-sql-val" class="mono">15%</strong></label>
+            <input id="mob-sql" type="range" min="0" max="100" value="15" />
+          </div>
+          <div class="slider-grp">
+            <label><span>Mobile Volume</span><strong id="mob-af-val" class="mono">85%</strong></label>
+            <input id="mob-af" type="range" min="0" max="100" value="85" />
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- MOBILE SETTINGS PANE -->
+    <div id="settings-pane" class="settings-pane">
+      <div class="card">
+        <strong>Independent Mobile Audio per Radio (Windows unaffected)</strong>
+        <div class="ctrl-row">
+          <button id="mob-cfg-rx1" class="pill-btn" style="flex:1;">Radio 1 Audio: OFF</button>
+          <button id="mob-cfg-rx2" class="pill-btn" style="flex:1;">Radio 2 Audio: OFF</button>
+        </div>
+        <div style="font-size:11px; color:var(--muted);">
+          Both radios start muted on mobile. When you enable a radio and signal exceeds Mobile SQL, Windows local speakers mute automatically. Pressing PTT activates your phone mic automatically.
+        </div>
+      </div>
+
+      <div class="card">
+        <strong>Radio DSP &amp; TX Power</strong>
+        <div class="ctrl-row">
+          <button id="mob-nb" class="pill-btn">NB</button>
+          <button id="mob-nr" class="pill-btn">NR</button>
+          <button id="mob-notch" class="pill-btn">NOTCH</button>
+          <button id="mob-split" class="pill-btn">SPLIT</button>
+          <button id="mob-pre" class="pill-btn">PRE</button>
+        </div>
+        <div class="slider-grp">
+          <label><span>Radio TX Power</span><strong id="mob-pwr-val" class="mono">50%</strong></label>
+          <input id="mob-pwr" type="range" min="1" max="100" value="50" />
+        </div>
+      </div>
+
+      <div class="card">
+        <strong>QTH Locator (Distance &amp; Bearing)</strong>
+        <div class="ctrl-row">
+          <input id="mob-qth-in" type="text" maxlength="10" placeholder="KP20" style="flex:1;" />
+          <button id="mob-qth-save" class="pill-btn active">Save QTH</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <strong>Waterfall Span</strong>
+        <div class="ctrl-row">
+          <button class="pill-btn mob-span" data-span="50000">±25k</button>
+          <button class="pill-btn mob-span" data-span="100000">±50k</button>
+          <button class="pill-btn mob-span" data-span="200000">±100k</button>
+          <button class="pill-btn mob-span" data-span="500000">±250k</button>
+        </div>
+      </div>
+    </div>
+    <!-- MOBILE REPEATER BROWSER WINDOW (Tunes MAIN & auto-closes) -->
+    <div id="mob-rep-modal" class="mob-rep-modal">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <strong>Nordic &amp; FI Repeaters (Tunes MAIN)</strong>
+        <div style="display:flex; gap:6px;">
+          <button id="mob-rep-view-btn" class="pill-btn">🗺 Map</button>
+          <button id="mob-rep-refresh" class="pill-btn">↻</button>
+          <button id="mob-rep-close" class="pill-btn warn">Close</button>
+        </div>
+      </div>
+      <div class="ctrl-row">
+        <input id="mob-rep-search" type="text" placeholder="Search callsign / QTH / freq..." style="flex:1;" />
+        <select id="mob-rep-band" style="width:auto;">
+          <option value="all">All</option>
+          <option value="2m">2m</option>
+          <option value="70cm">70cm</option>
+          <option value="23cm">23cm</option>
+          <option value="6m">6m</option>
+          <option value="10m">10m</option>
+        </select>
+      </div>
+      <div id="mob-rep-list" style="flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:6px;"></div>
+      <div id="mob-rep-map-wrap" style="display:none; flex:1; position:relative; border-radius:8px; overflow:hidden; border:1px solid var(--border); min-height:260px;">
+        <div id="mob-rep-map" style="width:100%; height:100%;"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/vendor/leaflet.js"></script>
+  <script src="/static/waterfall3d.js"></script>
+  <script src="/static/mobile.js"></script>
+</body>
+</html>
