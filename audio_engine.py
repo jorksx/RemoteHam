@@ -185,7 +185,7 @@ class AudioEngine:
 
         # Config & live radio references
         self.mode: str = "host"  # "host" or "client"
-        self.routing: Dict[int, str] = {1: "right", 2: "left"}
+        self.routing: Dict[int, str] = {1: "both", 2: "both"}
         self.master_volume: float = 0.85
         self.windows_mute: Dict[int, bool] = {1: False, 2: False}
         self.windows_volume: Dict[int, int] = {1: 85, 2: 85}
@@ -356,8 +356,8 @@ class AudioEngine:
         with self._lock:
             self.mode = cfg.get("mode", "host")
             ar = cfg.get("audio_routing", {})
-            self.routing[1] = ar.get("radio1_channel", "right")
-            self.routing[2] = ar.get("radio2_channel", "left")
+            self.routing[1] = ar.get("radio1_channel", "both")
+            self.routing[2] = ar.get("radio2_channel", "both")
             pc_cfg = cfg.get("pc_audio", {})
             self.master_volume = max(0.0, min(1.0, pc_cfg.get("master_volume", 85) / 100.0))
             ui_cfg = cfg.get("ui", {})

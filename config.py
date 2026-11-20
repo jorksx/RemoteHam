@@ -47,8 +47,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "master_volume": 85,
     },
     "audio_routing": {
-        "radio1_channel": "right",  # "left", "right", "both", "mute"
-        "radio2_channel": "left",
+        "radio1_channel": "both",  # "left", "right", "both", "mute"
+        "radio2_channel": "both",
         "tx_interlock": True,
     },
     "ptt_global": False,  # False = only when app window is active, True = works globally
