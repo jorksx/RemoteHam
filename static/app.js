@@ -381,6 +381,12 @@
     }
   }
 
+  function getPersonalSql(slot) {
+    const m = fullState?.windows_sql || {};
+    const v = m[String(slot)] ?? m[slot];
+    return v != null ? Number(v) : 15;
+  }
+
   function fmtTabFreq(hz) {
     if (!hz) return "---";
     return (hz / 1e6).toFixed(3);
@@ -555,6 +561,7 @@
       const tab = document.getElementById(`rig-tab-${slot}`);
       tab.classList.toggle("active", !dualView && activeSlot === slot);
       tab.classList.toggle("r2", slot === 2);
+      tab.title = (!rs?.connected && rs?.error) ? String(rs.error) : "";
 
       const dot = document.getElementById(`tab-dot-${slot}`);
       dot.className = rs?.tx ? "tab-dot tx" : (rs?.connected ? "tab-dot online" : "tab-dot");
@@ -725,8 +732,9 @@
     setSliderVisual(document.getElementById("sl-rf"), r.rf_gain ?? 100, 0, 100);
     document.getElementById("val-sl-rf").textContent = String(r.rf_gain ?? 100);
 
-    setSliderVisual(document.getElementById("sl-sql"), r.sql ?? 15, 0, 100);
-    document.getElementById("val-sl-sql").textContent = String(r.sql ?? 15);
+    const personalSql = getPersonalSql(activeSlot);
+    setSliderVisual(document.getElementById("sl-sql"), personalSql, 0, 100);
+    document.getElementById("val-sl-sql").textContent = String(personalSql);
 
     document.querySelectorAll(".pre-btn").forEach((b) => b.classList.toggle("active", Number(b.dataset.pre) === (r.preamp || 0)));
 
@@ -779,6 +787,31 @@
       const hasTyped = Boolean((cwLiveEl?.value || "").trim());
       cwSendBtn.classList.toggle("cw-tx", liveTx);
       cwSendBtn.textContent = liveTx ? (hasTyped ? "ADD TO TX" : "STOP CW") : "SEND";
+    }
+
+    // DTMF live box below CW SEND (visible whenever active repeater on selected VFO is FM/analog-capable)
+    const activeRepSel = r.active_repeater?.[isSub ? "sub" : "main"] || null;
+    const dtmfWrap = document.getElementById("dtmf-live-wrap");
+    if (dtmfWrap) {
+      const canDtmf = Boolean(activeRepSel && (activeRepSel.mode !== "DV" || String(activeVfo?.mode || "").toUpperCase() === "FM"));
+      dtmfWrap.style.display = canDtmf ? "flex" : "none";
+      if (canDtmf) {
+        const repCall = String(activeRepSel.callsign || "REPEATER");
+        const repLbl = document.getElementById("dtmf-rep-lbl");
+        if (repLbl) repLbl.textContent = repCall;
+        const dtmfIn = document.getElementById("dtmf-live-input");
+        const dtmfBtn = document.getElementById("btn-dtmf-send");
+        const dtmfTx = Boolean(fullState.dtmf?.active && Number(fullState.dtmf?.slot || 0) === activeSlot);
+        if (dtmfIn) {
+          dtmfIn.title = repCall.includes("OH1DMR")
+            ? "OH1DMRA MetarInfo DTMF: 51# Pori · 5# Module ON · 0# Help · 01# Stations · 1# Pori · 2# EFHK · 3# TMP · 4# MIK · # Close"
+            : `Send DTMF tones (0-9 A-D * #) to ${repCall}`;
+        }
+        if (dtmfBtn) {
+          dtmfBtn.classList.toggle("cw-tx", dtmfTx);
+          dtmfBtn.textContent = dtmfTx ? "STOP DTMF" : "SEND DTMF";
+        }
+      }
     }
 
     // Audio Passthrough (Windows default playback -> Radio TX) + Mic Ignore dropdown + PTT warnings
@@ -961,10 +994,10 @@
       anim.peak = Math.max(targetNorm, anim.peak - 0.015);
     }
 
-    const sqlPct = r.sql ?? 0;
+    const sqlPct = getPersonalSql(r.slot || activeSlot);
     const sqlS = !isTx ? sqlPctToSUnits(sqlPct) : null;
     const sqlNorm = sqlS !== null ? Math.min(1, Math.max(0, (sqlS - 1) / 14)) : null;
-    const sqlOpen = sqlS !== null ? (r.has_hw_sql ? Boolean(r.sql_hw_open) : ((activeVfo?.s_units || 0) >= sqlS)) : false;
+    const sqlOpen = sqlS !== null ? (sqlPct <= 1 || (activeVfo?.s_units || 0) >= sqlS) : false;
     const sqlCol = sqlOpen ? "#10b981" : "#facc15";
     const readoutMain = isTx ? `PO ${r.pwr_meter || 0}%` : formatS(activeVfo?.s_units);
     const readoutSub = isTx ? `SWR ${(r.swr || 1.0).toFixed(1)}` : `${activeVfo?.dbm ?? -127} dBm`;
@@ -1312,7 +1345,7 @@
     const sNorm = Math.max(0, Math.min(1, ((activeVfo?.s_units || 1) - 1) / 14));
     drawBarGraph(canvasId, sNorm, (f) => (f > 8 / 14 ? "#ef4444" : (f > 0.35 ? "#10b981" : "#34d399")));
 
-    const sqlPct = r.sql ?? 0;
+    const sqlPct = getPersonalSql(r.slot || activeSlot);
     const sqlS = !r.tx ? sqlPctToSUnits(sqlPct) : null;
     if (sqlS !== null) {
       const sCanv = document.getElementById(canvasId);
@@ -1323,7 +1356,7 @@
         const ctx = sCanv.getContext("2d");
         const sqlNorm = Math.min(1, Math.max(0, (sqlS - 1) / 14));
         const sqlX = Math.max(2, Math.min(rect.width - 2, sqlNorm * rect.width));
-        const isOpen = r.has_hw_sql ? Boolean(r.sql_hw_open) : ((activeVfo?.s_units || 0) >= sqlS);
+        const isOpen = sqlPct <= 1 || (activeVfo?.s_units || 0) >= sqlS;
         const sqlCol = isOpen ? "#10b981" : "#facc15";
 
         ctx.save();
@@ -1732,12 +1765,24 @@
       });
     });
 
-    // VFO cards & toolbar
+    // VFO cards & toolbar (on Dual-RX rigs like IC-9700, clicking SUB swaps SUB into MAIN like A/B)
     document.getElementById("vfo-card-main").addEventListener("click", (e) => {
-      if (!e.target.closest("button")) sendCmd(activeSlot, "set_active_band", { band: "MAIN" });
+      if (e.target.closest("button")) return;
+      const r = fullState?.radios?.[String(activeSlot)];
+      if (r?.supports_dual_rx) {
+        if (r.active_band === "SUB") sendCmd(activeSlot, "set_active_band", { band: "MAIN" });
+        return;
+      }
+      sendCmd(activeSlot, "set_active_band", { band: "MAIN" });
     });
     document.getElementById("vfo-card-sub").addEventListener("click", (e) => {
-      if (!e.target.closest("button")) sendCmd(activeSlot, "set_active_band", { band: "SUB" });
+      if (e.target.closest("button")) return;
+      const r = fullState?.radios?.[String(activeSlot)];
+      if (r?.supports_dual_rx) {
+        sendCmd(activeSlot, "swap_vfo");
+        return;
+      }
+      sendCmd(activeSlot, "set_active_band", { band: "SUB" });
     });
 
     document.getElementById("btn-lock-vfo").addEventListener("click", () => {
@@ -1941,7 +1986,7 @@
     });
     bindSlider("sl-sql", 0, 100, (v) => {
       document.getElementById("val-sl-sql").textContent = String(v);
-      sendCmd(activeSlot, "set_level", { name: "sql", value: v });
+      sendCmd(activeSlot, "set_windows_sql", { sql: v });
     });
     bindSlider("sl-pbt1", 0, 100, (v) => {
       const hz = Math.round(((v - 50) / 50) * 1200);
@@ -2098,6 +2143,29 @@
       if (e.key === "Enter") {
         e.preventDefault();
         submitLiveCw();
+      }
+    });
+
+    // Repeater DTMF live sender (Enter or SEND DTMF -> key PTT + tones, clear & keep focus!)
+    const dtmfLiveIn = document.getElementById("dtmf-live-input");
+    const dtmfSendBtn = document.getElementById("btn-dtmf-send");
+    const submitLiveDtmf = () => {
+      const dtmfTx = Boolean(fullState?.dtmf?.active && Number(fullState?.dtmf?.slot || 0) === activeSlot);
+      const raw = (dtmfLiveIn?.value || "").trim().toUpperCase().replace(/[^0-9A-D*#,]/g, "");
+      if (!raw) {
+        if (dtmfTx) sendCmd(activeSlot, "abort_dtmf", {});
+        dtmfLiveIn?.focus();
+        return;
+      }
+      sendCmd(activeSlot, "send_dtmf", { digits: raw });
+      dtmfLiveIn.value = "";
+      dtmfLiveIn.focus();
+    };
+    dtmfSendBtn?.addEventListener("click", submitLiveDtmf);
+    dtmfLiveIn?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        submitLiveDtmf();
       }
     });
 
@@ -2791,8 +2859,22 @@
         sendCmd(slot, "set_windows_mute", { mute: !cur });
       });
 
-      document.getElementById(`dual-vfo-main-${slot}`).addEventListener("click", () => sendCmd(slot, "set_active_band", { band: "MAIN" }));
-      document.getElementById(`dual-vfo-sub-${slot}`).addEventListener("click", () => sendCmd(slot, "set_active_band", { band: "SUB" }));
+      document.getElementById(`dual-vfo-main-${slot}`).addEventListener("click", () => {
+        const r = fullState?.radios?.[String(slot)];
+        if (r?.supports_dual_rx) {
+          if (r.active_band === "SUB") sendCmd(slot, "set_active_band", { band: "MAIN" });
+          return;
+        }
+        sendCmd(slot, "set_active_band", { band: "MAIN" });
+      });
+      document.getElementById(`dual-vfo-sub-${slot}`).addEventListener("click", () => {
+        const r = fullState?.radios?.[String(slot)];
+        if (r?.supports_dual_rx) {
+          sendCmd(slot, "swap_vfo");
+          return;
+        }
+        sendCmd(slot, "set_active_band", { band: "SUB" });
+      });
 
       document.getElementById(`dual-lock-${slot}`).addEventListener("click", (e) => {
         e.stopPropagation();
@@ -2936,7 +3018,9 @@
       };
       bindDualLvl(`dual-sl-af-${slot}`, "af_gain");
       bindDualLvl(`dual-sl-rf-${slot}`, "rf_gain");
-      bindDualLvl(`dual-sl-sql-${slot}`, "sql");
+      document.getElementById(`dual-sl-sql-${slot}`).addEventListener("input", (e) => {
+        sendCmd(slot, "set_windows_sql", { sql: Number(e.target.value) });
+      });
       bindDualLvl(`dual-sl-pwr-${slot}`, "tx_power");
 
       pane.querySelectorAll(`.dual-vm-${slot}`).forEach((btn) => {
@@ -2983,9 +3067,10 @@
 
     document.getElementById(`dual-mode-pill-${slot}`).textContent = activeVfo?.mode || "---";
     document.getElementById(`dual-s-txt-${slot}`).textContent = formatS(activeVfo?.s_units);
+    const winSql = getPersonalSql(slot);
     document.getElementById(`dual-pwr-txt-${slot}`).textContent = r.tx
       ? `PWR ${r.pwr_meter || 0}% · SWR ${(r.swr || 1).toFixed(1)}`
-      : `SQL ${r.sql ?? 15}`;
+      : `SQL ${winSql}`;
     document.getElementById(`dual-tele-${slot}`).textContent = `${(r.id_amps || 0).toFixed(1)}A · ${(r.vd_volts || 0).toFixed(1)}V`;
 
     const muted = Boolean((fullState.windows_mute || {})[String(slot)] ?? (fullState.windows_mute || {})[slot]);
@@ -3091,8 +3176,8 @@
     document.getElementById(`dual-v-af-${slot}`).textContent = String(r.af_gain ?? 50);
     setSliderVisual(document.getElementById(`dual-sl-rf-${slot}`), r.rf_gain ?? 100, 0, 100);
     document.getElementById(`dual-v-rf-${slot}`).textContent = String(r.rf_gain ?? 100);
-    setSliderVisual(document.getElementById(`dual-sl-sql-${slot}`), r.sql ?? 15, 0, 100);
-    document.getElementById(`dual-v-sql-${slot}`).textContent = String(r.sql ?? 15);
+    setSliderVisual(document.getElementById(`dual-sl-sql-${slot}`), winSql, 0, 100);
+    document.getElementById(`dual-v-sql-${slot}`).textContent = String(winSql);
     setSliderVisual(document.getElementById(`dual-sl-pwr-${slot}`), r.tx_power ?? 50, 1, 100);
     document.getElementById(`dual-v-pwr-${slot}`).textContent = `${r.tx_power ?? 50}%`;
 

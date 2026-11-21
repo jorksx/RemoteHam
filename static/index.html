@@ -206,6 +206,14 @@
             <input id="cw-live-input" class="tin mono cw-live-input" type="text" maxlength="120" placeholder="Type CW text &amp; Enter..." />
             <button id="btn-cw-send" class="cbtn cw-send-btn" type="button" title="Send typed CW text (Enter)">SEND</button>
           </div>
+          <div id="dtmf-live-wrap" class="dtmf-live-wrap" style="display:none;">
+            <div class="sl-head" style="margin-bottom:1px;">
+              <span>DTMF · <strong id="dtmf-rep-lbl" style="color:var(--amber);"></strong></span>
+              <span class="mono muted-xs">0-9 A-D * #</span>
+            </div>
+            <input id="dtmf-live-input" class="tin mono cw-live-input" type="text" maxlength="24" placeholder="e.g. 51# or 1#..." />
+            <button id="btn-dtmf-send" class="cbtn cw-send-btn" type="button" title="Key PTT &amp; transmit DTMF tones (Enter)">SEND DTMF</button>
+          </div>
         </section>
 
         <section class="side-block" style="margin-top:auto;">
@@ -354,7 +362,6 @@
             </div>
             <div class="wf-right">
               <span id="wf-hover-hz" class="mono muted-xs">Wheel: 1 kHz · Click: Tune</span>
-              <span class="mini-pill active">3D + 2D</span>
             </div>
           </div>
           <div class="wf-canvas-wrap">

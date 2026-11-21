@@ -10,7 +10,7 @@ import time
 import wave
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import sounddevice as sd
@@ -72,6 +72,47 @@ def render_cw_sidetone(text: str, wpm: int, freq_hz: float = 700.0) -> np.ndarra
     env_all = np.concatenate(segs)
     t = np.arange(env_all.size, dtype=np.float32) * (2.0 * np.pi * freq_hz / SAMPLE_RATE)
     return (0.24 * env_all * np.sin(t)).astype(np.float32)
+
+
+DTMF_TONES: Dict[str, Tuple[int, int]] = {
+    "1": (697, 1209), "2": (697, 1336), "3": (697, 1477), "A": (697, 1633),
+    "4": (770, 1209), "5": (770, 1336), "6": (770, 1477), "B": (770, 1633),
+    "7": (852, 1209), "8": (852, 1336), "9": (852, 1477), "C": (852, 1633),
+    "*": (941, 1209), "0": (941, 1336), "#": (941, 1477), "D": (941, 1633),
+}
+
+
+def render_dtmf_sequence(digits: str) -> np.ndarray:
+    """Synthesize repeater-safe ITU-T DTMF sequence (650ms TX/CTCSS lead, 130ms tone, 100ms gap, 220ms tail)."""
+    cleaned = [ch for ch in str(digits or "").upper() if ch in DTMF_TONES or ch == ","]
+    if not any(ch in DTMF_TONES for ch in cleaned):
+        return np.zeros(0, dtype=np.float32)
+    tone_n = int(round(0.130 * SAMPLE_RATE))
+    gap_n = int(round(0.100 * SAMPLE_RATE))
+    comma_n = int(round(0.350 * SAMPLE_RATE))
+    lead_n = int(round(0.650 * SAMPLE_RATE))
+    tail_n = int(round(0.220 * SAMPLE_RATE))
+    ramp_n = max(1, int(round(0.005 * SAMPLE_RATE)))
+
+    env = np.ones(tone_n, dtype=np.float32)
+    if tone_n > 2 * ramp_n:
+        r = 0.5 * (1.0 - np.cos(np.linspace(0.0, np.pi, ramp_n, dtype=np.float32)))
+        env[:ramp_n] = r
+        env[-ramp_n:] = r[::-1]
+
+    t = np.arange(tone_n, dtype=np.float32) / SAMPLE_RATE
+    segs: List[np.ndarray] = [np.zeros(lead_n, dtype=np.float32)]
+    for ch in cleaned:
+        if ch == ",":
+            segs.append(np.zeros(comma_n, dtype=np.float32))
+            continue
+        f_lo, f_hi = DTMF_TONES[ch]
+        # Linear level (~0.29 peak with +1.8 dB high-group pre-emphasis) to avoid FM modulator clipping
+        sig = (0.13 * np.sin(2.0 * np.pi * f_lo * t) + 0.16 * np.sin(2.0 * np.pi * f_hi * t)) * env
+        segs.append(sig.astype(np.float32))
+        segs.append(np.zeros(gap_n, dtype=np.float32))
+    segs.append(np.zeros(tail_n, dtype=np.float32))
+    return np.concatenate(segs).astype(np.float32)
 
 
 def sql_pct_to_s_pct(sql_pct: float) -> float:
@@ -199,6 +240,7 @@ class AudioEngine:
         self.radio_data_mode: Dict[int, bool] = {1: False, 2: False}
         self.radio_has_hw_sql: Dict[int, bool] = {1: False, 2: False}
         self.radio_hw_sql_open: Dict[int, bool] = {1: True, 2: True}
+        self.radio_hw_sql_level: Dict[int, int] = {1: 15, 2: 15}
         self.radio_cw_tx: Dict[int, bool] = {1: False, 2: False}
         self._cw_lock = threading.Lock()
         self._cw_sidetone_last_seq: Dict[int, int] = {1: 0, 2: 0}
@@ -211,6 +253,11 @@ class AudioEngine:
         self._mobile_connected: bool = False
         self._tone_1750: Dict[int, bool] = {1: False, 2: False}
         self._tone_phase: Dict[int, float] = {1: 0.0, 2: 0.0}
+        self._dtmf_lock = threading.Lock()
+        self.dtmf_active: bool = False
+        self.dtmf_radio: int = 0
+        self._dtmf_buf: Optional[np.ndarray] = None
+        self._dtmf_pos: int = 0
 
         # Audio callbacks for WebSocket streaming (to mobile and remote PC clients)
         self.on_radio_rx_frame: Optional[Callable[[int, bytes, float], None]] = None
@@ -306,7 +353,7 @@ class AudioEngine:
             return
         mute_slot = self.swr_scan_mute_slot
         if self.mode == "host":
-            if self.active_tx_source == "pc" and not self.voice_play_active:
+            if self.active_tx_source == "pc" and not self.voice_play_active and not self.dtmf_active:
                 for slot in (1, 2):
                     if self.radio_tx.get(slot) and slot != mute_slot:
                         self._push_radio_tx(slot, stereo_48k)
@@ -370,6 +417,8 @@ class AudioEngine:
                         self.windows_volume[s] = max(0, min(100, int(rcfg["win_volume"])))
                     if "win_mute" in rcfg:
                         self.windows_mute[s] = bool(rcfg["win_mute"])
+                    if "sql_threshold" in rcfg:
+                        self.windows_sql[s] = max(0, min(100, int(rcfg["sql_threshold"])))
             self._dev_cfg = cfg
 
         self._rebuild_pc_streams(cfg)
@@ -397,7 +446,7 @@ class AudioEngine:
         self.radio_connected[slot] = now_connected
         self.radio_dual_rx[slot] = bool(state.get("supports_dual_rx", False))
         self.radio_tx[slot] = bool(state.get("tx", False))
-        self.windows_sql[slot] = int(state.get("sql", 15))
+        self.radio_hw_sql_level[slot] = int(state.get("sql", 15))
         self.windows_af[slot] = int(state.get("af_gain", 75))
 
         active_key = "sub" if state.get("active_band") == "SUB" else "main"
@@ -722,6 +771,30 @@ class AudioEngine:
                         outdata[:, 1] = tone
                     return
 
+                if self.dtmf_active and self.dtmf_radio == _slot:
+                    dtmf_blk = np.zeros(frames, dtype=np.float32)
+                    with self._dtmf_lock:
+                        if self.dtmf_active and self.dtmf_radio == _slot and self._dtmf_buf is not None:
+                            buf = self._dtmf_buf
+                            pos = self._dtmf_pos
+                            avail = min(frames, buf.size - pos)
+                            if avail > 0:
+                                dtmf_blk[:avail] = buf[pos : pos + avail]
+                                self._dtmf_pos = pos + avail
+                            if self._dtmf_pos >= buf.size:
+                                self.dtmf_active = False
+                                self.dtmf_radio = 0
+                                self._dtmf_buf = None
+                                self._dtmf_pos = 0
+                    if self.qso_rec_active and self.radio_tx.get(_slot):
+                        self._qso_tx_ring.push(np.column_stack([dtmf_blk, dtmf_blk]))
+                    if outdata.shape[1] == 1:
+                        outdata[:, 0] = dtmf_blk
+                    else:
+                        outdata[:, 0] = dtmf_blk
+                        outdata[:, 1] = dtmf_blk
+                    return
+
                 if self.voice_play_active and self.voice_play_radio == _slot:
                     finished_radio = 0
                     vm_blk = np.zeros(frames, dtype=np.float32)
@@ -766,6 +839,39 @@ class AudioEngine:
 
     def set_tone_1750(self, slot: int, active: bool) -> None:
         self._tone_1750[slot] = bool(active)
+
+    def set_dtmf_standby(self, radio_slot: int) -> None:
+        """Hold silent TX carrier on slot while CI-V PTT engages, blocking mic/passthrough leak."""
+        with self._dtmf_lock:
+            self._radio_tx_rings[radio_slot].clear()
+            self._dtmf_buf = None
+            self._dtmf_pos = 0
+            self.dtmf_radio = radio_slot
+            self.dtmf_active = True
+
+    def start_dtmf_play(self, radio_slot: int, digits: str) -> float:
+        buf = render_dtmf_sequence(digits)
+        if buf.size == 0:
+            return 0.0
+        with self._dtmf_lock:
+            self._radio_tx_rings[radio_slot].clear()
+            self._dtmf_buf = buf
+            self._dtmf_pos = 0
+            self.dtmf_radio = radio_slot
+            self.dtmf_active = True
+        with self._cw_lock:
+            self._cw_sidetone_chunks[radio_slot].append((buf * 0.35).astype(np.float32))
+        return float(buf.size) / SAMPLE_RATE
+
+    def stop_dtmf_play(self) -> None:
+        with self._dtmf_lock:
+            r = self.dtmf_radio
+            self.dtmf_active = False
+            self.dtmf_radio = 0
+            self._dtmf_buf = None
+            self._dtmf_pos = 0
+        if r in (1, 2):
+            self._radio_tx_rings[r].clear()
 
     def _push_radio_tx(self, slot: int, stereo_48k: np.ndarray) -> None:
         ring = self._radio_tx_rings.get(slot)
@@ -813,10 +919,6 @@ class AudioEngine:
         thresh_pct = sql_pct_to_s_pct(float(sql))
         eff_thresh = max(0.4, thresh_pct)
         s_pct = self.radio_s_pct.get(slot, 0.0)
-        if self.radio_has_hw_sql.get(slot, False):
-            if self.radio_hw_sql_open.get(slot, False):
-                return True
-            return bool(self.radio_dualwatch.get(slot, False) and s_pct >= eff_thresh)
         now = time.monotonic()
         if self.radio_connected.get(slot, False):
             if s_pct >= eff_thresh:

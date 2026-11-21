@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -46,6 +47,33 @@ MODE_REV = {
 }
 
 FILTER_HZ = {1: 3000, 2: 2400, 3: 1800}
+
+# Model prefix -> standard Icom default CI-V address (for targeted probing when CI-V Transceive = OFF)
+ICOM_DEFAULT_CIV_ADDRS: Tuple[Tuple[str, int], ...] = (
+    ("IC-7300", 0x94),
+    ("IC-9700", 0xA2),
+    ("IC-7610", 0x98),
+    ("IC-705", 0xA4),
+    ("IC-7100", 0x88),
+    ("IC-7600", 0x7A),
+    ("IC-9100", 0x7C),
+    ("IC-785", 0x8E),
+    ("IC-7700", 0x74),
+    ("IC-7760", 0xB2),
+    ("IC-905", 0xAC),
+    ("IC-7410", 0x80),
+    ("IC-7200", 0x76),
+    ("IC-7000", 0x70),
+    ("IC-R8600", 0x96),
+    ("IC-7800", 0x6A),
+    ("IC-756PRO3", 0x6E),
+    ("IC-756PRO2", 0x64),
+    ("IC-756PRO", 0x5C),
+    ("IC-746PRO", 0x66),
+    ("IC-7400", 0x66),
+    ("IC-718", 0x5E),
+    ("IC-706MK2G", 0x58),
+)
 
 MORSE_UNITS: Dict[str, int] = {
     "A": 5, "B": 9, "C": 11, "D": 7, "E": 1, "F": 9, "G": 9, "H": 7, "I": 3,
@@ -187,6 +215,7 @@ class IcomCivRadio:
         self._cw_live_queue: List[str] = []
         self._swr_task: Optional[asyncio.Task] = None
         self._swr_abort_ev = asyncio.Event()
+        self._suspend_poll: int = 0
 
         # Scope multi-division assembly per receiver (0=Main, 1=Sub)
         self._scope_asm: Dict[int, Dict[str, Any]] = {
@@ -210,6 +239,7 @@ class IcomCivRadio:
             "supports_tuner": False,
             "supports_pbt": False,
             "supports_29_prefix": False,
+            "supports_vfo_25": False,
             "tuner_on": False,
             "tuning": False,
             "dualwatch": False,
@@ -357,22 +387,39 @@ class IcomCivRadio:
                     await asyncio.sleep(2.0)
                     continue
 
-                # Open serial port in worker thread
-                self._serial = await asyncio.to_thread(
-                    serial.Serial,
-                    self.com_port,
-                    self.baud_rate,
-                    timeout=0.02,
-                    write_timeout=0.5,
-                )
-                self._rx_buf.clear()
-
-                # Refresh USB bus model string on connect (never hardcoded)
+                # Refresh USB bus model & driver metadata before opening serial port
+                port_meta = None
                 for p in usb_discovery.list_serial_ports_with_usb():
                     if p["port"].upper() == self.com_port.upper():
+                        port_meta = p
                         self.state["usb_model"] = p.get("usb_model", "")
                         self.state["usb_serial"] = p.get("usb_serial", "")
                         break
+
+                vidpid = str((port_meta or {}).get("usb_vidpid") or "").upper()
+                usb_model_up = str(self.state.get("usb_model") or "").upper()
+                is_usb_rig = (
+                    "VID_10C4" in vidpid
+                    or "VID_0403" in vidpid
+                    or "VID_0C26" in vidpid
+                    or "IC-" in usb_model_up
+                )
+
+                # Open serial port in worker thread (keep DTR/RTS deasserted on native USB rigs so USB SEND/Keying isn't keyed)
+                def _open_serial() -> serial.Serial:
+                    ser = serial.Serial()
+                    ser.port = self.com_port
+                    ser.baudrate = self.baud_rate
+                    ser.timeout = 0.02
+                    ser.write_timeout = 0.5
+                    if is_usb_rig:
+                        ser.dtr = False
+                        ser.rts = False
+                    ser.open()
+                    return ser
+
+                self._serial = await asyncio.to_thread(_open_serial)
+                self._rx_buf.clear()
 
                 # Discover CI-V address via broadcast 0x19 0x00
                 addr = await self._probe_civ_address()
@@ -439,17 +486,30 @@ class IcomCivRadio:
                         [0x15, 0x15],  # VDD Voltage
                     ]
                 else:
+                    if self.state.get("supports_vfo_25", True):
+                        freq_mode_cmds = [
+                            [0x25, 0x00],  # Selected VFO freq
+                            [0x15, 0x02],
+                            [0x25, 0x01],  # Unselected VFO freq
+                            [0x15, 0x05],
+                            [0x15, 0x02],
+                            [0x26, 0x00],  # Selected mode
+                            [0x15, 0x02],
+                            [0x26, 0x01],  # Unselected mode
+                        ]
+                    else:
+                        freq_mode_cmds = [
+                            [0x03],        # Universal operating frequency
+                            [0x15, 0x02],
+                            [0x04],        # Universal operating mode
+                            [0x15, 0x05],
+                            [0x15, 0x02],
+                            [0x1A, 0x06],  # DATA mode status
+                        ]
                     poll_cmds = [
                         [0x15, 0x02],  # S-meter
                         [0x15, 0x05],  # Radio squelch open/closed
-                        [0x25, 0x00],  # Selected VFO freq
-                        [0x15, 0x02],
-                        [0x25, 0x01],  # Unselected VFO freq
-                        [0x15, 0x05],
-                        [0x15, 0x02],
-                        [0x26, 0x00],  # Selected mode
-                        [0x15, 0x02],
-                        [0x26, 0x01],  # Unselected mode
+                        *freq_mode_cmds,
                         [0x15, 0x05],
                         [0x15, 0x02],
                         [0x1C, 0x00],  # PTT
@@ -488,7 +548,7 @@ class IcomCivRadio:
 
                 poll_idx = 0
                 while self._running and self._serial and self._serial.is_open:
-                    if self.state.get("swr_scan", {}).get("active"):
+                    if self._suspend_poll > 0 or self.state.get("swr_scan", {}).get("active"):
                         await asyncio.sleep(0.05)
                         continue
                     await self._read_available()
@@ -514,22 +574,71 @@ class IcomCivRadio:
                 await self._close_serial()
                 await asyncio.sleep(2.5)
 
+    def _build_probe_candidates(self) -> List[int]:
+        """Build ordered CI-V probe addresses: broadcast 0x00, USB model default, known defaults, then remaining 0x01..0xDF."""
+        candidates: List[int] = [0x00]
+        model_up = str(self.state.get("usb_model") or "").upper()
+        for prefix, addr in ICOM_DEFAULT_CIV_ADDRS:
+            if prefix in model_up and addr not in candidates:
+                candidates.append(addr)
+        for _, addr in ICOM_DEFAULT_CIV_ADDRS:
+            if addr not in candidates:
+                candidates.append(addr)
+        return candidates
+
+    async def _probe_single_target(self, target_addr: int, payload: List[int], timeout: float) -> int:
+        """Send one CI-V probe with 4x 0xFE preambles (helps Auto-baud lock) and return responder CI-V address or 0."""
+        if not self._serial:
+            return 0
+        # 4 preambles match Icom's Auto-baud wake recommendation at 115200 baud
+        frame = bytes([0xFE, 0xFE, 0xFE, 0xFE, target_addr, 0xE0]) + bytes(payload) + bytes([0xFD])
+        await asyncio.to_thread(self._serial.reset_input_buffer)
+        self._rx_buf.clear()
+        await asyncio.to_thread(self._serial.write, frame)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            chunk = await asyncio.to_thread(self._serial.read, 256)
+            if chunk:
+                self._rx_buf.extend(chunk)
+                for frm in self._extract_frames():
+                    if (
+                        len(frm) >= 6
+                        and frm[2] in (0xE0, 0x00)
+                        and frm[3] not in (0x00, 0xE0)
+                        and frm[4] in (0x19, 0x03, 0xFA, 0xFB)
+                    ):
+                        return frm[3]
+            await asyncio.sleep(0.008)
+        return 0
+
     async def _probe_civ_address(self) -> int:
         if not self._serial:
             return 0
-        frame = bytes([0xFE, 0xFE, 0x00, 0xE0, 0x19, 0x00, 0xFD])
-        for _ in range(3):
-            await asyncio.to_thread(self._serial.reset_input_buffer)
-            await asyncio.to_thread(self._serial.write, frame)
-            deadline = time.monotonic() + 0.35
-            while time.monotonic() < deadline:
-                chunk = await asyncio.to_thread(self._serial.read, 256)
-                if chunk:
-                    self._rx_buf.extend(chunk)
-                    for frm in self._extract_frames():
-                        if len(frm) >= 7 and frm[2] == 0xE0 and frm[3] != 0xE0 and frm[4] == 0x19:
-                            return frm[3]
-                await asyncio.sleep(0.02)
+        # 1. Try broadcast 0x00 (fast path when CI-V Transceive = ON)
+        for _ in range(2):
+            addr = await self._probe_single_target(0x00, [0x19, 0x00], timeout=0.14)
+            if addr:
+                return addr
+
+        # 2. Try targeted USB-matched + known Icom default addresses (handles CI-V Transceive = OFF)
+        priority = [a for a in self._build_probe_candidates() if a != 0x00]
+        for cand in priority:
+            addr = await self._probe_single_target(cand, [0x19, 0x00], timeout=0.05)
+            if addr:
+                return addr
+            # Older Icom rigs without 0x19 support still respond to 0x03 Read Frequency
+            addr = await self._probe_single_target(cand, [0x03], timeout=0.05)
+            if addr:
+                return addr
+
+        # 3. Fallback sweep across remaining 0x01..0xDF addresses in case a custom CI-V address is set
+        tested = set(priority) | {0x00, 0xE0}
+        for cand in range(0x01, 0xE0):
+            if cand in tested:
+                continue
+            addr = await self._probe_single_target(cand, [0x03], timeout=0.025)
+            if addr:
+                return addr
         return 0
 
     async def _probe_capabilities(self) -> None:
@@ -559,34 +668,40 @@ class IcomCivRadio:
         resp_pbt = await self._send_and_expect([0x14, 0x07], timeout=0.25)
         self.state["supports_pbt"] = bool(resp_pbt and resp_pbt[4] != 0xFA)
 
-        # Check 0x29 Main/Sub direct command prefix support
+        # Check 0x29 Main/Sub direct command prefix support, or 0x25/0x26 VFO read/set support (IC-7300 >= v1.40)
         if self.state["supports_dual_rx"]:
             resp_29 = await self._send_and_expect([0x29, 0x00, 0x03], timeout=0.2)
             self.state["supports_29_prefix"] = bool(resp_29 and resp_29[4] != 0xFA)
+            self.state["supports_vfo_25"] = False
         else:
             self.state["supports_29_prefix"] = False
+            resp_25 = await self._send_and_expect([0x25, 0x00], timeout=0.25)
+            self.state["supports_vfo_25"] = bool(resp_25 and resp_25[4] == 0x25)
+            log.info("Slot %s CI-V probe: supports_vfo_25=%s", self.slot, self.state["supports_vfo_25"])
 
     async def _poll_dual_rx_bands(self) -> None:
         """Query both MAIN and SUB bands explicitly on Dual-RX radios (e.g. IC-9700) without losing active band."""
         orig_band = self.state.get("active_band", "MAIN")
+        self._suspend_poll += 1
+        try:
+            # Query MAIN
+            self.state["active_band"] = "MAIN"
+            await self._send_and_expect([0x07, 0xD0], timeout=0.2)
+            await self._send_and_expect([0x03], timeout=0.2)
+            await self._send_and_expect([0x04], timeout=0.2)
+            await self._send_and_expect([0x15, 0x02], timeout=0.2)
 
-        # Query MAIN
-        self.state["active_band"] = "MAIN"
-        await self._send_and_expect([0x07, 0xD0], timeout=0.2)
-        await self._send_and_expect([0x03], timeout=0.2)
-        await self._send_and_expect([0x04], timeout=0.2)
-        await self._send_and_expect([0x15, 0x02], timeout=0.2)
-
-        # Query SUB
-        self.state["active_band"] = "SUB"
-        await self._send_and_expect([0x07, 0xD1], timeout=0.2)
-        await self._send_and_expect([0x03], timeout=0.2)
-        await self._send_and_expect([0x04], timeout=0.2)
-        await self._send_and_expect([0x15, 0x02], timeout=0.2)
-
-        # Restore original band
-        self.state["active_band"] = orig_band
-        await self._send_and_expect([0x07, 0xD1 if orig_band == "SUB" else 0xD0], timeout=0.2)
+            # Query SUB
+            self.state["active_band"] = "SUB"
+            await self._send_and_expect([0x07, 0xD1], timeout=0.2)
+            await self._send_and_expect([0x03], timeout=0.2)
+            await self._send_and_expect([0x04], timeout=0.2)
+            await self._send_and_expect([0x15, 0x02], timeout=0.2)
+        finally:
+            # Restore original band cleanly
+            self.state["active_band"] = orig_band
+            await self._send_and_expect([0x07, 0xD1 if orig_band == "SUB" else 0xD0], timeout=0.2)
+            self._suspend_poll = max(0, self._suspend_poll - 1)
 
     async def _poll_full_state(self) -> None:
         if self.state["supports_dual_rx"]:
@@ -602,19 +717,41 @@ class IcomCivRadio:
                 [0x0F], [0x1C, 0x00], [0x21, 0x00], [0x21, 0x01],
             ]
         else:
-            cmds = [
-                [0x25, 0x00], [0x25, 0x01],
-                [0x26, 0x00], [0x26, 0x01],
-                [0x15, 0x02],
-                [0x14, 0x01], [0x14, 0x02], [0x14, 0x03], [0x14, 0x0A],
-                [0x15, 0x05], [0x16, 0x02], [0x11], [0x16, 0x12],
-                [0x16, 0x22], [0x16, 0x40], [0x16, 0x48],
-                [0x16, 0x41], [0x16, 0x42], [0x16, 0x43], [0x16, 0x44],
-                [0x16, 0x45], [0x16, 0x46], [0x16, 0x47],
-                [0x14, 0x06], [0x14, 0x0B], [0x14, 0x0C], [0x14, 0x0D],
-                [0x14, 0x0E], [0x14, 0x12], [0x14, 0x15], [0x15, 0x15],
-                [0x0F], [0x1C, 0x00], [0x21, 0x00], [0x21, 0x01],
-            ]
+            if not self.state.get("supports_vfo_25", True):
+                # Universal fallback (e.g. IC-7300 firmware < v1.40): sync active VFO A & VFO B cleanly once
+                self.state["active_band"] = "SUB"
+                await self._send_confirmed([0x07, 0x01])
+                for c in ([0x03], [0x04], [0x1A, 0x06]):
+                    await self._send_and_expect(c, timeout=0.2)
+                self.state["active_band"] = "MAIN"
+                await self._send_confirmed([0x07, 0x00])
+                for c in ([0x03], [0x04], [0x1A, 0x06]):
+                    await self._send_and_expect(c, timeout=0.2)
+                cmds = [
+                    [0x15, 0x02],
+                    [0x14, 0x01], [0x14, 0x02], [0x14, 0x03], [0x14, 0x0A],
+                    [0x15, 0x05], [0x16, 0x02], [0x11], [0x16, 0x12],
+                    [0x16, 0x22], [0x16, 0x40], [0x16, 0x48],
+                    [0x16, 0x41], [0x16, 0x42], [0x16, 0x43], [0x16, 0x44],
+                    [0x16, 0x45], [0x16, 0x46], [0x16, 0x47],
+                    [0x14, 0x06], [0x14, 0x0B], [0x14, 0x0C], [0x14, 0x0D],
+                    [0x14, 0x0E], [0x14, 0x12], [0x14, 0x15], [0x15, 0x15],
+                    [0x0F], [0x1C, 0x00], [0x21, 0x00], [0x21, 0x01],
+                ]
+            else:
+                cmds = [
+                    [0x25, 0x00], [0x25, 0x01],
+                    [0x26, 0x00], [0x26, 0x01],
+                    [0x15, 0x02],
+                    [0x14, 0x01], [0x14, 0x02], [0x14, 0x03], [0x14, 0x0A],
+                    [0x15, 0x05], [0x16, 0x02], [0x11], [0x16, 0x12],
+                    [0x16, 0x22], [0x16, 0x40], [0x16, 0x48],
+                    [0x16, 0x41], [0x16, 0x42], [0x16, 0x43], [0x16, 0x44],
+                    [0x16, 0x45], [0x16, 0x46], [0x16, 0x47],
+                    [0x14, 0x06], [0x14, 0x0B], [0x14, 0x0C], [0x14, 0x0D],
+                    [0x14, 0x0E], [0x14, 0x12], [0x14, 0x15], [0x15, 0x15],
+                    [0x0F], [0x1C, 0x00], [0x21, 0x00], [0x21, 0x01],
+                ]
         if self.state["supports_pbt"]:
             cmds.extend([[0x14, 0x07], [0x14, 0x08]])
         if self.state["supports_tuner"]:
@@ -779,6 +916,8 @@ class IcomCivRadio:
                 break
             if start > 0:
                 del self._rx_buf[:start]
+            while len(self._rx_buf) >= 3 and self._rx_buf[2] == 0xFE:
+                del self._rx_buf[0]
             end = self._rx_buf.find(b"\xfd", 2)
             if end < 0:
                 if len(self._rx_buf) > 4096:
@@ -848,14 +987,35 @@ class IcomCivRadio:
             self.state[key]["filter_hz"] = FILTER_HZ.get(f_byte, 2400)
             return True
 
-        # 0x04 Read mode
-        if cmd == 0x04 and len(payload) >= 1:
+        # 0x01 / 0x04 Transceive or Read mode
+        if cmd in (0x01, 0x04) and len(payload) >= 1:
             key = self._selected_target_key()
-            mode_str = MODE_MAP.get(payload[0], self.state[key]["mode"])
+            base_mode = MODE_MAP.get(payload[0], self.state[key]["mode"])
+            d_on = bool(self.state[key].get("data_mode", False))
+            if d_on and base_mode in ("USB", "LSB", "FM", "AM"):
+                mode_str = "DIGI" if base_mode == "USB" else f"{base_mode}-D"
+            else:
+                mode_str = base_mode
             self.state[key]["mode"] = mode_str
             if len(payload) >= 2:
                 self.state[key]["filter"] = payload[1]
                 self.state[key]["filter_hz"] = FILTER_HZ.get(payload[1], 2400)
+            return True
+
+        # 0x1A 0x06 DATA mode status
+        if cmd == 0x1A and len(payload) >= 2 and payload[0] == 0x06:
+            key = self._selected_target_key()
+            d_on = payload[1] != 0x00
+            self.state[key]["data_mode"] = d_on
+            cur_m = str(self.state[key].get("mode", ""))
+            base = "USB" if cur_m == "DIGI" else cur_m.replace("-D", "")
+            if d_on and base in ("USB", "LSB", "FM", "AM"):
+                self.state[key]["mode"] = "DIGI" if base == "USB" else f"{base}-D"
+            elif not d_on and cur_m in ("DIGI", "USB-D", "LSB-D", "FM-D", "AM-D"):
+                self.state[key]["mode"] = base or "USB"
+            if len(payload) >= 3 and payload[2] in FILTER_HZ:
+                self.state[key]["filter"] = payload[2]
+                self.state[key]["filter_hz"] = FILTER_HZ[payload[2]]
             return True
 
         # 0x07 0xD2 Main/Sub band selection
@@ -1160,117 +1320,146 @@ class IcomCivRadio:
             shift_hz = 0
             tx_hz = rx_hz
 
-        if target == "sub":
-            key = "sub"
-        elif target == "main":
-            key = "main"
-        elif target == "unselected":
-            key = self._unselected_target_key()
-        else:
-            key = self._selected_target_key()
+        self._suspend_poll += 1
+        try:
+            if self.state["supports_dual_rx"]:
+                # Ensure fresh hardware frequencies on both MAIN and SUB before band-collision check
+                await self._poll_dual_rx_bands()
+                if target == "sub":
+                    key = "sub"
+                elif target in ("main", "selected"):
+                    if self.state.get("active_band") == "SUB":
+                        await self.set_active_band("MAIN")
+                    key = "main"
+                elif target == "unselected":
+                    key = self._unselected_target_key()
+                else:
+                    key = "main"
 
-        # Dual-RX same-band collision guard: swap MAIN <-> SUB if the other RX is already on this band
-        if self.state["supports_dual_rx"]:
-            other_key = "main" if key == "sub" else "sub"
-            target_band = band_of_hz(rx_hz)
-            other_band = band_of_hz(int(self.state[other_key].get("freq_hz") or 0))
-            if target_band != "other" and target_band == other_band:
-                await self.swap_vfo()
-                await asyncio.sleep(0.04)
+                # Dual-RX same-band collision guard: swap MAIN <-> SUB if the other RX is already on this band
+                other_key = "main" if key == "sub" else "sub"
+                target_band = band_of_hz(rx_hz)
+                other_band = band_of_hz(int(self.state[other_key].get("freq_hz") or 0))
+                if target_band != "other" and target_band == other_band:
+                    await self.swap_vfo()
+                    await asyncio.sleep(0.04)
+            else:
+                if target == "sub":
+                    key = "sub"
+                elif target == "main":
+                    key = "main"
+                elif target == "unselected":
+                    key = self._unselected_target_key()
+                else:
+                    key = self._selected_target_key()
 
-        # Normalize modes & subaudible tone settings
-        modes_raw = str(rep.get("mode") or rep.get("modes") or "FM").upper()
-        is_dstar = bool(rep.get("is_dstar")) or ("DSTAR" in modes_raw) or ("D-STAR" in modes_raw) or (modes_raw == "DV") or (" DV" in modes_raw)
-        rep_mode = "DV" if is_dstar else "FM"
+            # Normalize modes & subaudible tone settings (prefer FM on hybrid repeaters e.g. DMR/DSTAR/FM)
+            ctcss_hz = float(rep.get("ctcss_hz") or rep.get("tone_hz") or 0.0)
+            tsql_hz = float(rep.get("tsql_hz") or 0.0)
+            tone_type = str(rep.get("tone_type") or "").upper()
+            tone_1750 = bool(rep.get("tone_1750")) or ("1750" in tone_type)
+            is_tsql = (tsql_hz > 0.0) or (("TSQL" in tone_type) and ctcss_hz > 0.0)
+            rx_tsql_hz = tsql_hz if tsql_hz > 0.0 else ctcss_hz
+            tx_tone_hz = ctcss_hz if ctcss_hz > 0.0 else tsql_hz
 
-        ctcss_hz = float(rep.get("ctcss_hz") or rep.get("tone_hz") or 0.0)
-        tsql_hz = float(rep.get("tsql_hz") or 0.0)
-        tone_type = str(rep.get("tone_type") or "").upper()
-        tone_1750 = bool(rep.get("tone_1750")) or ("1750" in tone_type)
-        is_tsql = (tsql_hz > 0.0) or (("TSQL" in tone_type) and ctcss_hz > 0.0)
-        rx_tsql_hz = tsql_hz if tsql_hz > 0.0 else ctcss_hz
-        tx_tone_hz = ctcss_hz if ctcss_hz > 0.0 else tsql_hz
+            modes_raw = str(rep.get("mode") or rep.get("modes") or "FM").upper()
+            mode_tokens = [t.strip() for t in re.split(r"[,/|\s]+", modes_raw) if t.strip()]
+            has_fm = ("FM" in mode_tokens) or (ctcss_hz > 0.0) or (tsql_hz > 0.0) or tone_1750
+            is_dstar_only = (not has_fm) and (
+                bool(rep.get("is_dstar")) or any(t in ("DSTAR", "D-STAR", "DV") for t in mode_tokens)
+            )
+            rep_mode = "DV" if is_dstar_only else "FM"
 
-        # Store active repeater record before tuning so frequency updates don't clear it
-        self.state["active_repeater"][key] = {
-            "callsign": str(rep.get("callsign") or ""),
-            "qth": str(rep.get("qth") or ""),
-            "rx_hz": rx_hz,
-            "tx_hz": tx_hz,
-            "shift_hz": shift_hz,
-            "ctcss_hz": ctcss_hz,
-            "tone_type": tone_type,
-            "tone_1750": tone_1750,
-            "mode": rep_mode,
-            "qrv": bool(rep.get("qrv", True)),
-        }
+            # Store active repeater record before tuning so frequency updates don't clear it
+            self.state["active_repeater"][key] = {
+                "callsign": str(rep.get("callsign") or ""),
+                "qth": str(rep.get("qth") or ""),
+                "rx_hz": rx_hz,
+                "tx_hz": tx_hz,
+                "shift_hz": shift_hz,
+                "ctcss_hz": ctcss_hz,
+                "tone_type": tone_type,
+                "tone_1750": tone_1750,
+                "mode": rep_mode,
+                "modes_raw": modes_raw,
+                "qrv": bool(rep.get("qrv", True)),
+            }
 
-        # Step 1: Receiver select
-        if self.state["supports_dual_rx"]:
-            await self.set_active_band("SUB" if key == "sub" else "MAIN")
+            # Step 1: Receiver select
+            if self.state["supports_dual_rx"]:
+                await self.set_active_band("SUB" if key == "sub" else "MAIN")
+                await asyncio.sleep(0.02)
+
+            # Step 2: RX frequency (collision already resolved cleanly above)
+            await self.set_frequency(rx_hz, target=key, _allow_band_swap=False)
             await asyncio.sleep(0.02)
 
-        # Step 2: RX frequency
-        await self.set_frequency(rx_hz, target=key)
-        await asyncio.sleep(0.02)
-
-        # Step 3: Mode (DV or FM)
-        await self.set_mode(rep_mode, target=key)
-        await asyncio.sleep(0.02)
-
-        # Step 4: Offset + Duplex direction
-        if shift_hz != 0:
-            off_bcd = list(encode_offset_bcd(abs(shift_hz)))
-            await self._send_to_rx([0x0D] + off_bcd, key, confirmed=True)
+            # Step 3: Mode (FM preferred on hybrid/analog, DV only for D-STAR-only)
+            await self.set_mode(rep_mode, target=key)
             await asyncio.sleep(0.02)
-            dup_code = 0x11 if shift_hz < 0 else 0x12
-            await self._send_to_rx([0x0F, dup_code], key, confirmed=True)
-        else:
-            await self._send_to_rx([0x0F, 0x10], key, confirmed=True)
-        await asyncio.sleep(0.02)
 
-        # Step 5: CTCSS / TSQL / 1750 tone frequency & tone mode (0x1B 0x00 / 0x01 + 0x16 0x42)
-        if is_tsql and tx_tone_hz > 0.0:
-            tx_bcd = list(encode_ctcss_bcd(tx_tone_hz))
-            rx_bcd = list(encode_ctcss_bcd(rx_tsql_hz))
-            await self._send_to_rx([0x1B, 0x00] + tx_bcd, key, confirmed=True)
+            # Step 4: Offset + Duplex direction
+            if shift_hz != 0:
+                off_bcd = list(encode_offset_bcd(abs(shift_hz)))
+                await self._send_to_rx([0x0D] + off_bcd, key, confirmed=True)
+                await asyncio.sleep(0.02)
+                dup_code = 0x11 if shift_hz < 0 else 0x12
+                await self._send_to_rx([0x0F, dup_code], key, confirmed=True)
+            else:
+                await self._send_to_rx([0x0F, 0x10], key, confirmed=True)
             await asyncio.sleep(0.02)
-            await self._send_to_rx([0x1B, 0x01] + rx_bcd, key, confirmed=True)
-            await asyncio.sleep(0.02)
-            await self._send_to_rx([0x16, 0x42, 0x02], key, confirmed=True)
-            self.state["tone_mode"] = 2
-            self.state["tone_on"] = True
-            self.state["tsql_on"] = True
-        elif ctcss_hz > 0.0:
-            t_bcd = list(encode_ctcss_bcd(ctcss_hz))
-            await self._send_to_rx([0x1B, 0x00] + t_bcd, key, confirmed=True)
-            await asyncio.sleep(0.02)
-            await self._send_to_rx([0x16, 0x42, 0x01], key, confirmed=True)
-            self.state["tone_mode"] = 1
-            self.state["tone_on"] = True
-            self.state["tsql_on"] = False
-        elif tone_1750:
-            t_bcd = list(encode_ctcss_bcd(1750.0))
-            await self._send_to_rx([0x1B, 0x00] + t_bcd, key, confirmed=True)
-            await asyncio.sleep(0.02)
-            await self._send_to_rx([0x16, 0x42, 0x00], key, confirmed=True)
-            self.state["tone_mode"] = 0
-            self.state["tone_on"] = False
-            self.state["tsql_on"] = False
-        else:
-            await self._send_to_rx([0x16, 0x42, 0x00], key, confirmed=True)
-            self.state["tone_mode"] = 0
-            self.state["tone_on"] = False
-            self.state["tsql_on"] = False
 
-        self._notify_state()
+            # Step 5: CTCSS / TSQL / 1750 tone frequency & tone mode (0x1B 0x00 / 0x01 + 0x16 0x42)
+            if is_tsql and tx_tone_hz > 0.0:
+                tx_bcd = list(encode_ctcss_bcd(tx_tone_hz))
+                rx_bcd = list(encode_ctcss_bcd(rx_tsql_hz))
+                await self._send_to_rx([0x1B, 0x00] + tx_bcd, key, confirmed=True)
+                await asyncio.sleep(0.02)
+                await self._send_to_rx([0x1B, 0x01] + rx_bcd, key, confirmed=True)
+                await asyncio.sleep(0.02)
+                await self._send_to_rx([0x16, 0x42, 0x02], key, confirmed=True)
+                self.state["tone_mode"] = 2
+                self.state["tone_on"] = True
+                self.state["tsql_on"] = True
+            elif ctcss_hz > 0.0:
+                t_bcd = list(encode_ctcss_bcd(ctcss_hz))
+                await self._send_to_rx([0x1B, 0x00] + t_bcd, key, confirmed=True)
+                await asyncio.sleep(0.02)
+                await self._send_to_rx([0x16, 0x42, 0x01], key, confirmed=True)
+                self.state["tone_mode"] = 1
+                self.state["tone_on"] = True
+                self.state["tsql_on"] = False
+            elif tone_1750:
+                t_bcd = list(encode_ctcss_bcd(1750.0))
+                await self._send_to_rx([0x1B, 0x00] + t_bcd, key, confirmed=True)
+                await asyncio.sleep(0.02)
+                await self._send_to_rx([0x16, 0x42, 0x00], key, confirmed=True)
+                self.state["tone_mode"] = 0
+                self.state["tone_on"] = False
+                self.state["tsql_on"] = False
+            else:
+                await self._send_to_rx([0x16, 0x42, 0x00], key, confirmed=True)
+                self.state["tone_mode"] = 0
+                self.state["tone_on"] = False
+                self.state["tsql_on"] = False
 
-    async def set_frequency(self, freq_hz: int, target: str = "selected") -> None:
+            if self.state["supports_dual_rx"]:
+                await self._poll_dual_rx_bands()
+            self._notify_state()
+        finally:
+            self._suspend_poll = max(0, self._suspend_poll - 1)
+
+    async def set_frequency(self, freq_hz: int, target: str = "selected", _allow_band_swap: bool = True) -> None:
         bcd = encode_bcd_freq(freq_hz)
         if self.state["supports_dual_rx"]:
             cur_band = self.state.get("active_band", "MAIN")
             if target == "selected":
                 key = self._selected_target_key()
+                other_key = self._unselected_target_key()
+                t_band = band_of_hz(freq_hz)
+                if _allow_band_swap and t_band != "other" and t_band == band_of_hz(int(self.state[other_key].get("freq_hz") or 0)):
+                    await self.swap_vfo()
+                    key = self._selected_target_key()
                 await self._send_confirmed([0x05] + list(bcd))
             elif target == "unselected":
                 key = self._unselected_target_key()
@@ -1297,20 +1486,37 @@ class IcomCivRadio:
             self._notify_state()
             return
 
-        if target == "selected":
-            await self._send_confirmed([0x25, 0x00] + list(bcd))
-            key = self._selected_target_key()
-        elif target == "unselected":
-            await self._send_confirmed([0x25, 0x01] + list(bcd))
-            key = self._unselected_target_key()
-        elif target == "sub":
-            sub_code = 0x00 if self._selected_target_key() == "sub" else 0x01
-            await self._send_confirmed([0x25, sub_code] + list(bcd))
-            key = "sub"
-        else:  # main
-            main_code = 0x00 if self._selected_target_key() == "main" else 0x01
-            await self._send_confirmed([0x25, main_code] + list(bcd))
-            key = "main"
+        if self.state.get("supports_vfo_25", True):
+            if target == "selected":
+                await self._send_confirmed([0x25, 0x00] + list(bcd))
+                key = self._selected_target_key()
+            elif target == "unselected":
+                await self._send_confirmed([0x25, 0x01] + list(bcd))
+                key = self._unselected_target_key()
+            elif target == "sub":
+                sub_code = 0x00 if self._selected_target_key() == "sub" else 0x01
+                await self._send_confirmed([0x25, sub_code] + list(bcd))
+                key = "sub"
+            else:  # main
+                main_code = 0x00 if self._selected_target_key() == "main" else 0x01
+                await self._send_confirmed([0x25, main_code] + list(bcd))
+                key = "main"
+        else:
+            sel_key = self._selected_target_key()
+            if target == "selected":
+                key = sel_key
+            elif target == "unselected":
+                key = self._unselected_target_key()
+            else:
+                key = "sub" if target == "sub" else "main"
+            if key == sel_key:
+                await self._send_confirmed([0x05] + list(bcd))
+            else:
+                tgt_code = 0x01 if key == "sub" else 0x00
+                cur_code = 0x01 if sel_key == "sub" else 0x00
+                await self._send_confirmed([0x07, tgt_code])
+                await self._send_confirmed([0x05] + list(bcd))
+                await self._send_confirmed([0x07, cur_code])
         self.state[key]["freq_hz"] = int(freq_hz)
         rep = self.state.get("active_repeater", {}).get(key)
         if rep and not self.state.get("tx"):
@@ -1348,21 +1554,39 @@ class IcomCivRadio:
             self._notify_state()
             return
 
-        if target == "selected":
-            sel_code = 0x00
-            key = self._selected_target_key()
-        elif target == "unselected":
-            sel_code = 0x01
-            key = self._unselected_target_key()
-        elif target == "sub":
-            sel_code = 0x00 if self._selected_target_key() == "sub" else 0x01
-            key = "sub"
-        else:
-            sel_code = 0x00 if self._selected_target_key() == "main" else 0x01
-            key = "main"
+        if self.state.get("supports_vfo_25", True):
+            if target == "selected":
+                sel_code = 0x00
+                key = self._selected_target_key()
+            elif target == "unselected":
+                sel_code = 0x01
+                key = self._unselected_target_key()
+            elif target == "sub":
+                sel_code = 0x00 if self._selected_target_key() == "sub" else 0x01
+                key = "sub"
+            else:
+                sel_code = 0x00 if self._selected_target_key() == "main" else 0x01
+                key = "main"
 
-        flt = filter_num if filter_num in (1, 2, 3) else self.state[key]["filter"]
-        await self._send_confirmed([0x26, sel_code, m_byte, d_byte, flt])
+            flt = filter_num if filter_num in (1, 2, 3) else self.state[key]["filter"]
+            await self._send_confirmed([0x26, sel_code, m_byte, d_byte, flt])
+        else:
+            sel_key = self._selected_target_key()
+            if target == "selected":
+                key = sel_key
+            elif target == "unselected":
+                key = self._unselected_target_key()
+            else:
+                key = "sub" if target == "sub" else "main"
+            flt = filter_num if filter_num in (1, 2, 3) else self.state[key]["filter"]
+            need_swap = key != sel_key
+            if need_swap:
+                await self._send_confirmed([0x07, 0x01 if key == "sub" else 0x00])
+            await self._send_confirmed([0x06, m_byte, flt])
+            if m_byte in (0x00, 0x01, 0x02, 0x05):
+                await self._send_confirmed([0x1A, 0x06, 0x01 if d_byte else 0x00, flt if d_byte else 0x00])
+            if need_swap:
+                await self._send_confirmed([0x07, 0x01 if sel_key == "sub" else 0x00])
         self.state[key]["mode"] = m_upper
         self.state[key]["data_mode"] = bool(d_byte)
         self.state[key]["filter"] = flt
@@ -1428,21 +1652,37 @@ class IcomCivRadio:
         self._notify_state()
 
     async def swap_vfo(self) -> None:
-        reps = self.state.get("active_repeater")
-        if isinstance(reps, dict):
-            reps["main"], reps["sub"] = reps.get("sub"), reps.get("main")
-        await self._send_confirmed([0x07, 0xB0])
-        if self.state["supports_dual_rx"]:
-            await self._poll_dual_rx_bands()
-            self._notify_state()
-        else:
-            await self._send_cmd([0x25, 0x00])
-            await asyncio.sleep(0.03)
-            await self._send_cmd([0x25, 0x01])
-            await asyncio.sleep(0.03)
-            await self._send_cmd([0x26, 0x00])
-            await asyncio.sleep(0.03)
-            await self._send_cmd([0x26, 0x01])
+        self._suspend_poll += 1
+        try:
+            if self.state["supports_dual_rx"] and self.state.get("active_band") == "SUB":
+                await self._send_confirmed([0x07, 0xD0])
+                self.state["active_band"] = "MAIN"
+            reps = self.state.get("active_repeater")
+            if isinstance(reps, dict):
+                reps["main"], reps["sub"] = reps.get("sub"), reps.get("main")
+            await self._send_confirmed([0x07, 0xB0])
+            if self.state["supports_dual_rx"]:
+                await asyncio.sleep(0.04)
+                await self._poll_dual_rx_bands()
+                self._notify_state()
+            elif self.state.get("supports_vfo_25", True):
+                await self._send_cmd([0x25, 0x00])
+                await asyncio.sleep(0.03)
+                await self._send_cmd([0x25, 0x01])
+                await asyncio.sleep(0.03)
+                await self._send_cmd([0x26, 0x00])
+                await asyncio.sleep(0.03)
+                await self._send_cmd([0x26, 0x01])
+            else:
+                self.state["main"], self.state["sub"] = self.state["sub"], self.state["main"]
+                await self._send_cmd([0x03])
+                await asyncio.sleep(0.03)
+                await self._send_cmd([0x04])
+                await asyncio.sleep(0.03)
+                await self._send_cmd([0x1A, 0x06])
+                self._notify_state()
+        finally:
+            self._suspend_poll = max(0, self._suspend_poll - 1)
 
     async def set_dualwatch(self, on: bool) -> None:
         if self.state["supports_dualwatch"]:
@@ -1822,7 +2062,7 @@ class IcomCivRadio:
 
             if orig_mode != "RTTY" or orig_data:
                 m_byte, d_byte = MODE_REV["RTTY"]
-                if self.state["supports_dual_rx"]:
+                if self.state["supports_dual_rx"] or not self.state.get("supports_vfo_25", True):
                     ok_rtty = await self._send_confirmed([0x06, m_byte, orig_filter], retries=2)
                 else:
                     sel_code = 0x00

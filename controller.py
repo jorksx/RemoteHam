@@ -52,6 +52,7 @@ class AppController:
         self.radios: Dict[int, IcomCivRadio] = {}
         self.mirrored_states: Dict[int, Dict[str, Any]] = {}
         self.mirrored_voice_memory: Optional[Dict[str, Any]] = None
+        self.mirrored_dtmf: Optional[Dict[str, Any]] = None
 
         self.ui_clients: Set[web.WebSocketResponse] = set()
         self.mobile_clients: Dict[web.WebSocketResponse, MobileSession] = {}
@@ -76,6 +77,8 @@ class AppController:
         self.repeaters = RepeaterDatabase()
         self._1750_started_at: Dict[int, float] = {}
         self._1750_release_tasks: Dict[int, asyncio.Task] = {}
+        self._dtmf_task: Optional[asyncio.Task] = None
+        self._dtmf_tx_slot: int = 0
 
         # Voice Memory auto-repeat Timer state (Host authority)
         self._vm_timer_enabled: bool = False
@@ -126,6 +129,7 @@ class AppController:
 
     async def stop(self) -> None:
         self._cancel_vm_timer_countdown(disable=True)
+        await self._abort_dtmf_tx(release_ptt=False)
         if self._update_check_task:
             self._update_check_task.cancel()
             try:
@@ -212,6 +216,7 @@ class AppController:
             "audio_routing": self.cfg.get("audio_routing", {}),
             "windows_mute": dict(self.audio.windows_mute),
             "windows_volume": dict(self.audio.windows_volume),
+            "windows_sql": dict(self.audio.windows_sql),
             "windows_suppressed_by_mobile": self.audio.is_windows_suppressed_by_mobile(),
             "ptt_global": bool(self.cfg.get("ptt_global", False)),
             "ptt_binds": {
@@ -228,6 +233,7 @@ class AppController:
                 "r2_rms": round(self.audio.rx_rms.get(2, 0.0), 4),
             },
             "voice_memory": self._get_voice_memory_payload(mode),
+            "dtmf": self._get_dtmf_payload(mode),
             "qso_rec": self.audio.get_qso_rec_status(),
             "passthrough": self.audio.get_passthrough_status(),
             "update": dict(self.update_status),
@@ -312,6 +318,16 @@ class AppController:
             self._state_dirty = True
             return
 
+        if action == "set_windows_sql":
+            sql = max(0, min(100, int(params.get("sql", 15))))
+            self.audio.windows_sql[slot] = sql
+            for rc in self.cfg.get("radios", []):
+                if int(rc.get("slot", 0)) == slot:
+                    rc["sql_threshold"] = sql
+            cfg_mod.save_config(self.cfg)
+            self._state_dirty = True
+            return
+
         if action == "set_ui_prefs":
             ui = self.cfg.setdefault("ui", {"dual_view": False, "wf_track": False, "cw_macros": ["", "", "", ""], "smeter_style": 0})
             if "dual_view" in params:
@@ -389,6 +405,8 @@ class AppController:
                 await radio.abort_cw_macro(release_ptt=not tx_on)
             if radio._swr_task is not None and not radio._swr_task.done():
                 await radio.abort_swr_scan()
+            if self._dtmf_task is not None and not self._dtmf_task.done():
+                await self._abort_dtmf_tx(release_ptt=not tx_on)
             if tx_on and self.cfg.get("audio_routing", {}).get("tx_interlock", True):
                 other = self.radios.get(2 if slot == 1 else 1)
                 if other and other.state.get("tx"):
@@ -488,6 +506,11 @@ class AppController:
             target = str(params.get("target", "selected"))
             if hasattr(radio, "tune_repeater"):
                 await radio.tune_repeater(repeater, target=target)
+        elif action == "send_dtmf":
+            digits = str(params.get("digits", "")).strip()
+            await self._start_dtmf_tx(slot, digits)
+        elif action == "abort_dtmf":
+            await self._abort_dtmf_tx(release_ptt=True)
         elif action == "set_active_band":
             await radio.set_active_band(str(params.get("band", "MAIN")))
         elif action == "swap_vfo":
@@ -555,6 +578,77 @@ class AppController:
         vm["timer_slot"] = self._vm_timer_slot
         vm["timer_remaining"] = round(max(0.0, self._vm_timer_remaining), 1)
         return vm
+
+    def _get_dtmf_payload(self, mode: str) -> Dict[str, Any]:
+        if mode == "client" and isinstance(self.mirrored_dtmf, dict):
+            return dict(self.mirrored_dtmf)
+        active = bool(self._dtmf_task is not None and not self._dtmf_task.done())
+        return {"active": active, "slot": self._dtmf_tx_slot if active else 0}
+
+    async def _abort_dtmf_tx(self, release_ptt: bool = True) -> None:
+        self.audio.stop_dtmf_play()
+        task = self._dtmf_task
+        slot_was = self._dtmf_tx_slot
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=1.5)
+            except Exception:
+                pass
+        self._dtmf_task = None
+        self._dtmf_tx_slot = 0
+        if release_ptt and slot_was in self.radios:
+            try:
+                await self.radios[slot_was].set_ptt(False)
+            except Exception:
+                pass
+        self._state_dirty = True
+
+    async def _start_dtmf_tx(self, slot: int, digits: str) -> None:
+        radio = self.radios.get(slot)
+        if not radio or not radio.state.get("connected"):
+            return
+        await self._abort_dtmf_tx(release_ptt=False)
+        self._cancel_vm_timer_countdown(disable=True)
+        if self.audio.voice_play_active:
+            self.audio.stop_voice_play()
+        if radio._cw_task is not None and not radio._cw_task.done():
+            await radio.abort_cw_macro(release_ptt=True)
+        if radio._swr_task is not None and not radio._swr_task.done():
+            await radio.abort_swr_scan()
+        if self.cfg.get("audio_routing", {}).get("tx_interlock", True):
+            other = self.radios.get(2 if slot == 1 else 1)
+            if other and other.state.get("tx"):
+                await other.abort_cw_macro(release_ptt=True)
+                await other.set_ptt(False)
+
+        from audio_engine import render_dtmf_sequence
+        if render_dtmf_sequence(digits).size == 0:
+            return
+        self._dtmf_tx_slot = slot
+        self._state_dirty = True
+
+        async def _runner() -> None:
+            try:
+                self.audio.active_tx_source = "dtmf"
+                self.audio.set_dtmf_standby(slot)
+                await radio.set_ptt(True)
+                dur_s = self.audio.start_dtmf_play(slot, digits)
+                if dur_s > 0.0:
+                    await asyncio.sleep(dur_s + 0.08)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self.audio.stop_dtmf_play()
+                try:
+                    await radio.set_ptt(False)
+                except Exception:
+                    pass
+                if self._dtmf_tx_slot == slot:
+                    self._dtmf_tx_slot = 0
+                self._state_dirty = True
+
+        self._dtmf_task = asyncio.create_task(_runner())
 
     @staticmethod
     def _current_async_task() -> Optional[asyncio.Task]:
@@ -722,7 +816,7 @@ class AppController:
                 r_connected = self.audio.radio_connected.get(slot, False)
                 has_hw_sql = self.audio.radio_has_hw_sql.get(slot, False)
                 hw_open = self.audio.radio_hw_sql_open.get(slot, False)
-                radio_sql = self.audio.windows_sql.get(slot, 0)
+                radio_sql = self.audio.radio_hw_sql_level.get(slot, 0)
                 if sql <= 1:
                     is_open = True
                 elif r_connected:
@@ -764,6 +858,8 @@ class AppController:
                 self.audio.update_radio_state(slot, radios_map[s_key])
         if "voice_memory" in state_data:
             self.mirrored_voice_memory = state_data["voice_memory"]
+        if "dtmf" in state_data:
+            self.mirrored_dtmf = state_data["dtmf"]
         self._state_dirty = True
 
     def _on_remote_scope_received(self, payload: Dict[str, Any]) -> None:
